@@ -372,8 +372,7 @@ def extract_rewrite(output):
     return output.split("<rewrite>")[1].split("</rewrite>")[0]
 
 
-async def representation_variation_pipeline(
-    use_subset: bool,
+async def representation_variation_pipeline(use_subset: bool,
     subset_size: int,
     chunk_size: int,
     input_dir: str,
@@ -409,8 +408,7 @@ async def representation_variation_pipeline(
     additional_dataset_context: str = "",
     task_id=None,
     seed=1048596,
-    **kwargs,
-):
+    **kwargs, anonymize=False,):
 
     filter_chunks_step = create_filter_chunks_step(output_file="synthetic_pretrain")
     generate_variations_step = RandomVariationStep(
@@ -527,7 +525,9 @@ async def representation_variation_pipeline(
                 keep_folder_structure=True,
                 output_dir=chunking_output_dir,
                 seed=seed,
-            )
+
+            , anonymize=anonymize
+        )
         else:
             working_list = read_and_chunk_text(
                 input_dir,
@@ -537,7 +537,9 @@ async def representation_variation_pipeline(
                 keep_folder_structure=True,
                 output_dir=output_dir,
                 seed=seed,
-            )
+
+            , anonymize=anonymize
+        )
 
         # loaded_list_1 = read_jsonl_completions(input_dir=input_dir)
         # loaded_list_2 = read_text(input_dir=input_dir)
@@ -559,7 +561,7 @@ async def representation_variation_pipeline(
             keep_folder_structure=True,
             input_dir=input_dir,
             output_dir=chunking_output_dir if chunking_output_dir else output_dir,
-        )
+        , anonymize=anonymize)
 
         if use_subset:
             working_list = subset_text_list(

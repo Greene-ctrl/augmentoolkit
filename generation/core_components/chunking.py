@@ -10,6 +10,7 @@ import nltk  # NOTE to get this performing at all I need to make it so that chun
 nltk.download("punkt_tab")
 from tqdm import tqdm
 from transformers import AutoTokenizer
+from augmentoolkit.utils.anonymization import anonymize_text
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 try:
@@ -305,6 +306,7 @@ def chunking_algorithm_str(
     max_token_length=1500,
     keep_folder_structure=False,
     input_dir="",
+    anonymize=False,
 ):
     """
     Combines format handling from Algorithm 1 with token-based chunking from Algorithm 2
@@ -327,6 +329,10 @@ def chunking_algorithm_str(
         # print(basename)
 
     # From Algorithm 2: Paragraph splitting and token-based logic
+    # Anonymize if requested
+    if anonymize:
+        content = anonymize_text(content)
+
     paragraphs = content.split("\n\n")
 
     for paragraph in paragraphs:
@@ -582,6 +588,7 @@ def chunk_text_list(
     keep_folder_structure=False,
     input_dir="",
     output_dir=None,
+    anonymize=False,
 ):
     """
     Chunks a list of text dictionaries, with optional caching.
@@ -633,6 +640,7 @@ def chunk_text_list(
             max_token_length=chunk_size,
             keep_folder_structure=keep_folder_structure,
             input_dir=input_dir,
+            anonymize=anonymize,
         )
         chunks.extend(new_chunks)
 
@@ -657,6 +665,7 @@ def read_and_chunk_text(
     keep_folder_structure=False,
     output_dir=None,
     seed=1048596,
+    anonymize=False,
 ):  # for splitting up documents
     # Print source texts for debugging
     # source_texts = []
@@ -667,7 +676,12 @@ def read_and_chunk_text(
     # Use composition of read_text and chunk_text_list
     text_list = read_text(input_dir, extensions, output_dir=output_dir)
     sentence_chunks = chunk_text_list(
-        text_list, chunk_size, keep_folder_structure, input_dir, output_dir=output_dir
+        text_list,
+        chunk_size,
+        keep_folder_structure,
+        input_dir,
+        output_dir=output_dir,
+        anonymize=anonymize,
     )
     # print("Ran this")
 

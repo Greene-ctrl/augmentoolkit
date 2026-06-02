@@ -165,6 +165,7 @@ async def generate_multi_source_dataset(
     use_subset,
     subset_size,
     output_dir,
+    anonymize=False,
     cost_per_million_small_input,
     cost_per_million_small_output,
     cost_per_million_large_input,
@@ -345,6 +346,7 @@ async def generate_multi_source_dataset(
             keep_folder_structure=True,
             output_dir=chunking_output_dir if chunking_output_dir else output_dir,
             seed=seed,
+            anonymize=anonymize,
         )
 
     else:
@@ -357,7 +359,7 @@ async def generate_multi_source_dataset(
             keep_folder_structure=True,
             input_dir=input_dir,
             output_dir=chunking_output_dir if chunking_output_dir else output_dir,
-        )
+        , anonymize=anonymize)
         print("!!LEN OF SENTENCE CHNKS")
         print(len(sentence_chunks))
 

@@ -366,6 +366,7 @@ async def rptoolkit_pipeline(
     meta_datagen_extras,
     to_include_features,
     chunking_output_dir=None,
+    anonymize=False,
     task_id=None,
     seed=1048596,
     **kwargs,
@@ -507,6 +508,7 @@ async def rptoolkit_pipeline(
             subset_size=subset_size,
             output_dir=chunking_output_dir,
             seed=seed,
+            anonymize=anonymize,
         )  # todo make this func take jsonl with "text" and json with "text" too!
     else:
         paragraphs_processed = read_and_chunk_text(
@@ -516,6 +518,7 @@ async def rptoolkit_pipeline(
             subset_size=subset_size,
             output_dir=output_dir,
             seed=seed,
+            anonymize=anonymize,
         )  # todo make this func take jsonl with "text" and json with "text" too!
     print("Counting tokens...")
     total_tokens = count_total_tokens(paragraphs_processed)

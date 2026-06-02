@@ -54,8 +54,7 @@ clean_pdf_step = PipelineStep(
 )
 
 
-async def pdf_clean_and_convert_pipeline(
-    use_subset: bool,
+async def pdf_clean_and_convert_pipeline(use_subset: bool,
     subset_size: int,
     chunk_size: int,
     input_dir: str,
@@ -82,8 +81,7 @@ async def pdf_clean_and_convert_pipeline(
     task_id=None,
     seed=1048596,
     do_not_use_llm=False,
-    **kwargs,
-):
+    **kwargs, anonymize=False,):
     prompts = make_relative_to_self(prompts)
     default_prompts = make_relative_to_self(default_prompts)
 
@@ -177,6 +175,7 @@ async def pdf_clean_and_convert_pipeline(
             extensions=[".pdf"],
             output_dir=chunking_output_dir if chunking_output_dir else output_dir,
             seed=seed,
+            anonymize=anonymize,
         )
         if use_subset:
             chunks = chunks[:subset_size]
@@ -190,9 +189,11 @@ async def pdf_clean_and_convert_pipeline(
             #     use_subset=use_subset,
             #     subset_size=subset_size,
             #     extensions=[".pdf"]
-            # )
+            #
+            , anonymize=anonymize
+        )
         else:
-            chunks = chunk_text_list(texts_passed_in)
+            chunks = chunk_text_list(texts_passed_in, anonymize=anonymize)
             chunks = chunks[
                 :subset_size
             ]  # not using the typical random subsetting because texts passed in subsetting is literally only used in test environments.

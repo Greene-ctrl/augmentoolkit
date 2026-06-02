@@ -57,3 +57,7 @@ torch
 peft
 discord.py
 hf_transfer
+# Anonymization
+presidio-analyzer
+presidio-anonymizer
+spacy

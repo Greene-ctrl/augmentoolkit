@@ -77,8 +77,7 @@ def extract_qa_tuples(text):
 # worth remembering this pattern for later though
 
 
-async def rag_data_pipeline(
-    input_dir: str,
+async def rag_data_pipeline(input_dir: str,
     output_dir: str,
     use_subset: bool,
     subset_size: int,
@@ -117,8 +116,7 @@ async def rag_data_pipeline(
     chunking_output_dir=None,
     task_id=None,
     seed=1048596,
-    **kwargs,  # All nodes MUST have **kwargs
-):
+    **kwargs,  # All nodes MUST have **kwargs, anonymize=False):
     prompts = make_relative_to_self(prompts)
     default_prompts = make_relative_to_self(default_prompts)
     filter_chunks_step = create_filter_chunks_step(output_file="rag_convs")
@@ -219,7 +217,9 @@ async def rag_data_pipeline(
                 subset_size=subset_size,
                 output_dir=chunking_output_dir,
                 seed=seed,
-            )
+
+            , anonymize=anonymize
+        )
         else:
             sentence_chunks = read_and_chunk_text(
                 input_dir=input_dir,
@@ -228,11 +228,13 @@ async def rag_data_pipeline(
                 subset_size=subset_size,
                 output_dir=output_dir,
                 seed=seed,
-            )
+
+            , anonymize=anonymize
+        )
 
     else:
         print("Using text chunks passed in...")
-        sentence_chunks = chunk_text_list(text_chunks_passed_in, chunk_size)
+        sentence_chunks = chunk_text_list(text_chunks_passed_in, chunk_size, anonymize=anonymize)
 
     set_progress(
         task_id,

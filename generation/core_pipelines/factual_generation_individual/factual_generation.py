@@ -118,6 +118,7 @@ async def generate_factual_qa_dataset(
     subset_size,
     double_check_counter,
     output_dir,
+    anonymize=False,
     cost_per_million_small_input,
     cost_per_million_small_output,
     cost_per_million_large_input,
@@ -460,6 +461,7 @@ async def generate_factual_qa_dataset(
             keep_folder_structure=True,
             output_dir=chunking_output_dir if chunking_output_dir else output_dir,
             seed=seed,
+            anonymize=anonymize,
         )
         print("LENGTH of sentence chunks passed in")
         print(len(sentence_chunks))
@@ -471,7 +473,7 @@ async def generate_factual_qa_dataset(
             keep_folder_structure=True,
             input_dir=input_dir,
             output_dir=chunking_output_dir if chunking_output_dir else output_dir,
-        )
+        , anonymize=anonymize)
         if use_subset:
             sentence_chunks = subset_text_list(
                 subset_size=subset_size, text_list=sentence_chunks, seed=seed

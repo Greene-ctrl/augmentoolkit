@@ -103,6 +103,7 @@ All configs are fully annotated with comments and placeholders to help you under
             - [Debug (health check)](docs/debug.md)
             - [Starting Point (build your own pipeline!)](docs/example.md)
             - [RPToolkit](docs/rptoolkit.md)
+            - [Style and Persona Fine-Tuning Guide](docs/style_finetuning.md)
         - [Utility]()
             - [Basic LLM Server](docs/basic_server.md)
             - [RAG LLM Server](docs/rag_server.md)

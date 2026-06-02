@@ -260,7 +260,7 @@ def create_axolotl_conversations(conversations, output_dir, template):
         json.dump(axolotl_conversations, f, indent=2)
 
 
-async def correction_pipeline(  # requirement: the node must have the same argument names as the fields in the config
+async def correction_pipeline(# requirement: the node must have the same argument names as the fields in the config
     use_subset: bool,
     subset_size: int,
     chunk_size: int,
@@ -292,8 +292,7 @@ async def correction_pipeline(  # requirement: the node must have the same argum
     chunking_output_dir=None,
     task_id=None,
     seed=1048596,
-    **kwargs,  # All nodes MUST have **kwargs
-):
+    **kwargs,  # All nodes MUST have **kwargs, anonymize=False):
     filter_chunks_step = create_filter_chunks_step(output_file="correction_data")
     # Check if kwargs is not empty and print all keys and values if present
     if kwargs:
@@ -389,6 +388,7 @@ async def correction_pipeline(  # requirement: the node must have the same argum
             subset_size=subset_size,
             output_dir=chunking_output_dir if chunking_output_dir else output_dir,
             seed=seed,
+            anonymize=anonymize,
         )
     else:
         sentence_chunks = chunk_text_list(
@@ -397,7 +397,7 @@ async def correction_pipeline(  # requirement: the node must have the same argum
             keep_folder_structure=True,
             input_dir=input_dir,
             output_dir=chunking_output_dir if chunking_output_dir else output_dir,
-        )
+        , anonymize=anonymize)
         if use_subset:
             sentence_chunks = subset_text_list(
                 sentence_chunks, subset_size=subset_size, seed=seed
