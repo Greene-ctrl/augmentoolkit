@@ -6,6 +6,10 @@ This isn't quite as "quick" as the simple start scripts shown at the start, but 
 
 Here are those scripts again for reference, because they are the recommended way to start:
 
+
+> [!TIP]
+> If you are using a fork or a specific branch (like the one with new anonymization features), ensure you clone your own repository and checkout the correct branch before running the setup scripts.
+
 ### MacOS (interface)
 ```bash
 git clone https://github.com/e-p-armstrong/augmentoolkit.git
@@ -79,6 +83,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install uv
 uv pip install -r requirements.txt
+python3 -m spacy download en_core_web_lg
 
 # NOTE you will have to add your API key (and possibly your provider base URL, if you don't want to use deepinfra) to `./external_configs/complete_factual_datagen_example.yaml` 
 
@@ -95,6 +100,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install uv
 uv pip install -r requirements.txt
+python3 -m spacy download en_core_web_lg
 
 # NOTE you will have to add your API key (and possibly your provider base URL, if you don't want to use deepinfra) to `./external_configs/complete_factual_datagen_example.yaml`
 
@@ -111,6 +117,7 @@ python -m venv .venv
 .\.venv\Scripts\activate
 pip install uv
 uv pip install -r requirements.txt
+python3 -m spacy download en_core_web_lg
 
 # NOTE you will have to add your API key (and possibly your provider base URL, if you don't want to use deepinfra) to ./external_configs/complete_factual_datagen_example.yaml
 

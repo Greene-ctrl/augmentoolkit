@@ -235,6 +235,13 @@ if [ $? -ne 0 ]; then
 fi
 echo "Python dependencies installed successfully."
 
+# Download spaCy model for anonymization
+echo "Downloading spaCy model (en_core_web_lg) for anonymization..."
+python3 -m spacy download en_core_web_lg
+if [ $? -ne 0 ]; then
+    echo "WARNING: Failed to download spaCy model. Anonymization might fall back to NLTK."
+fi
+
 # --- Configure SSL Certificate Path ---
 echo "----------------------------------------"
 echo "Configuring SSL certificate path..."
