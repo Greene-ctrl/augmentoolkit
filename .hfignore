@@ -1,0 +1,35 @@
+.git/
+.venv/
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+
+# Frontend build artifacts and dependencies
+atk-interface/node_modules/
+atk-interface/dist/
+
+# Local logs and temp files
+helper_process_logs/
+logs/
+npm_dev.log
+uvicorn_dev.log
+llm_server_dev.log
+
+# Data and configs (we want a clean slate on HF Space usually, or just default examples)
+# Keep only necessary examples if any
+inputs/
+outputs/
+external_configs/
+models/
+
+# Exclude scripts used for local setup/cleanup
+clean_hf_space.py
+download_model.py
+!inputs/.gitkeep
+!outputs/.gitkeep
+!external_configs/.gitkeep
+!models/.gitkeep
