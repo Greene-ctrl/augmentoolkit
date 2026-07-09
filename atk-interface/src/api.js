@@ -1,6 +1,6 @@
 import { handleApiError, getApiUrl } from './utils/apiUtils';
 
-const API_BASE_URL = 'http://127.0.0.1:8000'; // Or use environment variable
+const API_BASE_URL = window.location.origin; // Use current origin for deployment
 
 // Helper to handle common fetch logic and errors
 async function handleApiResponse(response) {

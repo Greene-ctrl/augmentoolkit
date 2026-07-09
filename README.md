@@ -1,3 +1,9 @@
+---
+title: Augmentoolkit
+sdk: docker
+app_port: 7860
+---
+
 # Augmentoolkit - Data for Domain-expert AI
 Augmentoolkit creates domain-expert datasets that update an AI's brain (basically, its knowledge cutoff), so that the AI becomes an expert in an area of your choosing.
 

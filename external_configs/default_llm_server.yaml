@@ -1,0 +1,7 @@
+pipeline: basic-server
+prompt_path: inputs/default_prompt.txt
+template_path: generation/core_pipelines/recall_multiple_sources/prompts/multi_turn_assistant_conversation.yaml
+gguf_model_path: models/augmentoolkit-v0.1/Augmentoolkit-DataSpecialist-7.2B-Q8_0.gguf
+context_length: 4096
+llama_path: './llama.cpp'
+port: 8003

@@ -7,6 +7,7 @@ import yaml
 import sys
 import shutil
 import zipfile
+import httpx
 import os  # Import os module
 import tempfile  # Import the tempfile module
 import time  # Import time module
@@ -21,8 +22,10 @@ from fastapi import (
     Path as FastApiPath,
     Query,
     Body,
+    Request,
 )
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware  # Import CORS middleware
@@ -216,10 +219,16 @@ app.add_middleware(
 # and censor the history
 
 
-@app.get("/", summary="Health Check")
-async def read_root():
-    """Basic health check endpoint."""
-    return {"message": "Augmentoolkit API is running."}
+@app.get("/health", summary="Health Check")
+async def health_check():
+    """Health check endpoint for Hugging Face."""
+    return {"status": "ok", "message": "Augmentoolkit API is running."}
+
+
+@app.get("/api-docs", include_in_schema=False)
+async def api_docs_redirect():
+    """Redirect to API documentation."""
+    return RedirectResponse(url="/docs")
 
 
 @app.post(
@@ -2077,3 +2086,62 @@ def duplicate_config_file(request: DuplicateConfigRequest):
 # We need a new route for creating a config file with a given name, for a given pipeline alias. We can reuse existing POST to create a new empty config in the configs folder. And config delete etc. will be... just added to the interface like norma. Making a folder in the config folder for organization may have to be a new route as well.
 # So two new routes, a use for the configs inside the generation folder, and a solution that makes both API *AND* CLI happy.
 # we also need a route to get the config that a pipeline is beingrun with. And for that we need to store the pipeline in redis. Run_pipeline_task specifically needs to store the parameters in redis associated with the task ID so that we can make a route to get the parameters based on task ID
+
+# --- Proxy LLM Server ---
+@app.api_route("/llm/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"], include_in_schema=False)
+async def proxy_llm(path: str, request: Request):
+    client = httpx.AsyncClient()
+    url = f"http://localhost:8003/{path}"
+    if request.url.query:
+        url += f"?{request.url.query}"
+
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
+
+    try:
+        req = client.build_request(
+            method=request.method,
+            url=url,
+            content=await request.body(),
+            headers=headers,
+            timeout=None
+        )
+        resp = await client.send(req, stream=True)
+
+        background_tasks = BackgroundTasks()
+        background_tasks.add_task(client.aclose)
+        return StreamingResponse(
+            resp.aiter_raw(),
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+            background=background_tasks
+        )
+    except Exception as e:
+        await client.aclose()
+        logger.error(f"Error proxying to LLM server: {e}")
+        return JSONResponse(status_code=503, content={"detail": f"LLM server offline or unreachable: {e}"})
+
+# --- Serve Frontend ---
+FRONTEND_DIST_DIR = PyPath("atk-interface/dist")
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_frontend(full_path: str):
+    # If the path looks like a file, try to serve it from dist
+    file_path = FRONTEND_DIST_DIR / full_path
+    if file_path.is_file():
+        return FileResponse(file_path)
+
+    # Check if it's in assets
+    assets_path = FRONTEND_DIST_DIR / "assets" / full_path
+    if assets_path.is_file():
+        return FileResponse(assets_path)
+
+    # Otherwise, serve index.html for SPA routing if it exists
+    index_html = FRONTEND_DIST_DIR / "index.html"
+    if index_html.is_file():
+        return FileResponse(index_html)
+
+    # Fallback to root health check if nothing else matches and frontend not built
+    if not full_path or full_path == "/":
+        return {"status": "ok", "message": "Augmentoolkit API is running (frontend not built)."}
+
+    raise HTTPException(status_code=404, detail="Not found")

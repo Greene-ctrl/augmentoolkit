@@ -21,7 +21,10 @@ function Chat() {
     const checkServerStatus = async () => {
       try {
         // Use the health endpoint instead of generate with empty messages
-        const response = await fetch(`http://127.0.0.1:${serverPort}/health`, {
+        const baseUrl = window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost'
+          ? `http://127.0.0.1:${serverPort}`
+          : `${window.location.origin}/llm`;
+        const response = await fetch(`${baseUrl}/health`, {
           method: 'GET',
           headers: { 'Content-Type': 'application/json' }
         });
@@ -85,7 +88,10 @@ function Chat() {
         // Add empty assistant message that we'll update
         setMessages(prev => [...prev, assistantMessage]);
         
-        const response = await fetch(`http://127.0.0.1:${serverPort}/generate-stream`, {
+        const baseUrl = window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost'
+          ? `http://127.0.0.1:${serverPort}`
+          : `${window.location.origin}/llm`;
+        const response = await fetch(`${baseUrl}/generate-stream`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ messages: apiMessages })
@@ -146,7 +152,10 @@ function Chat() {
         }
       } else {
         // Handle non-streaming response (original logic)
-        const response = await fetch(`http://127.0.0.1:${serverPort}/generate`, {
+        const baseUrl = window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost'
+          ? `http://127.0.0.1:${serverPort}`
+          : `${window.location.origin}/llm`;
+        const response = await fetch(`${baseUrl}/generate`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ messages: apiMessages })
@@ -242,7 +251,10 @@ function Chat() {
   const handleManualRefresh = async () => {
     setIsRefreshingStatus(true);
     try {
-      const response = await fetch(`http://127.0.0.1:${serverPort}/health`, {
+      const baseUrl = window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost'
+        ? `http://127.0.0.1:${serverPort}`
+        : `${window.location.origin}/llm`;
+      const response = await fetch(`${baseUrl}/health`, {
         method: 'GET',
         headers: { 'Content-Type': 'application/json' }
       });

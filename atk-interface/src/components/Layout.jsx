@@ -23,7 +23,10 @@ function Layout() {
   useEffect(() => {
     const checkServerStatus = async () => {
       try {
-        const response = await fetch('http://127.0.0.1:8003/health', {
+        const baseUrl = window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost'
+          ? 'http://127.0.0.1:8003'
+          : `${window.location.origin}/llm`;
+        const response = await fetch(`${baseUrl}/health`, {
           method: 'GET',
           headers: { 'Content-Type': 'application/json' }
         });
