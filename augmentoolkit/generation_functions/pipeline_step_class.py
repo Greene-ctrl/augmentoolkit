@@ -373,6 +373,26 @@ class PipelineStep:
         output_path = self.make_output_path(output_dir=output_dir)
         save_dataset(input_dict=input_dict, output_path=output_path)
 
+        job_id = os.environ.get("JOB_ID") or os.environ.get("TASK_ID")
+        work_repo = os.environ.get("HF_WORK_REPO")
+        if job_id and work_repo:
+            try:
+                from augmentoolkit.hf_persistence.checkpoint_manager import CheckpointManager
+                ckpt_mgr = CheckpointManager()
+                manifest = ckpt_mgr.load_remote_manifest(job_id=job_id, work_repo=work_repo)
+                if manifest:
+                    shard_id = getattr(self, "output_file", "step_output")
+                    ckpt_mgr.save_checkpoint(
+                        manifest=manifest,
+                        shard_id=shard_id,
+                        checkpoint_data=input_dict,
+                        stage=getattr(self, "result_key", "generation"),
+                        sync_remote=True
+                    )
+            except Exception as e:
+                print(f"ERROR: Fail-closed remote checkpoint sync failed for step {getattr(self, 'output_file', '')}: {e}")
+                raise e
+
     async def execute_pipeline(
         self,
         input_dict={},

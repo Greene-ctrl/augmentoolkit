@@ -10,6 +10,7 @@ openai
 requests
 httpx
 cohere
+huggingface_hub
 
 # Data Processing
 numpy
@@ -18,6 +19,7 @@ nltk
 scikit-learn
 nlpaug
 protobuf==3.20.0
+pyarrow
 
 # PDF & Document Processing
 pypdf
