@@ -264,6 +264,31 @@ def run_pipeline_task(
     source_path = parameters_flat.get("source_path")
     source_split = parameters_flat.get("source_split")
 
+    # Compute live prompt hash on initial job creation
+    path_aliases = {}
+    if os.path.exists(SUPER_CONFIG_PATH):
+        try:
+            with open(SUPER_CONFIG_PATH, "r", encoding="utf-8") as f:
+                path_aliases = yaml.safe_load(f).get("path_aliases", {})
+        except Exception:
+            pass
+
+    resolved_node_path = resolve_path(node_path, path_aliases) if path_aliases else node_path
+    pipeline_dir = os.path.dirname(resolved_node_path) if "/" in resolved_node_path else None
+
+    prompt_dir = parameters_flat.get("prompt_folder")
+    if not prompt_dir and pipeline_dir:
+        candidate_pdir = os.path.join(ATK3_DIRECTORY, pipeline_dir, "prompts")
+        if os.path.exists(candidate_pdir):
+            prompt_dir = candidate_pdir
+
+    default_prompt_dir = parameters_flat.get("default_prompt_folder")
+
+    live_prompt_hash = JobManifestManager.compute_live_prompt_hash(
+        prompt_folder=prompt_dir,
+        default_prompt_folder=default_prompt_dir,
+    )
+
     ckpt_mgr = CheckpointManager()
 
     # Pull source subset from HF_SOURCE_REPO if configured
@@ -297,6 +322,7 @@ def run_pipeline_task(
                     job_id=durable_job_id,
                     target_pipeline=node_path,
                     target_config_dict=parameters_flat,
+                    target_prompt_hash=live_prompt_hash,
                     target_source_repo=hf_source_repo,
                     target_source_revision=source_revision,
                     target_source_path=source_path,
@@ -318,6 +344,7 @@ def run_pipeline_task(
                     work_repo=hf_work_repo,
                     output_repo=hf_output_repo,
                     config_dict=parameters_flat,
+                    prompt_config_hash=live_prompt_hash,
                     sync_remote=False,
                 )
                 manifest.assign_task_id(task_id)

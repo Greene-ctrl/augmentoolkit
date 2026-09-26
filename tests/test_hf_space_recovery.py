@@ -212,6 +212,40 @@ class TestHFSpaceRecoveryIntegration(unittest.TestCase):
                 target_output_schema_version="2.0",
             )
 
+    def test_prompt_modification_causes_incompatible_resume(self):
+        """Regression test: create job with initial prompt hash -> alter prompt file -> resume must raise IncompatibleResumeError."""
+        prompt_dir = os.path.join(self.test_dir, "prompts")
+        os.makedirs(prompt_dir, exist_ok=True)
+        prompt_file = os.path.join(prompt_dir, "prompt1.yaml")
+
+        with open(prompt_file, "w", encoding="utf-8") as f:
+            f.write("template: Initial Prompt Template v1")
+
+        initial_prompt_hash = JobManifestManager.compute_live_prompt_hash(prompt_folder=prompt_dir)
+
+        manifest = self.ckpt_mgr.init_job_manifest(
+            job_id="prompt_mod_test_job",
+            pipeline="example-pipeline",
+            prompt_config_hash=initial_prompt_hash,
+            sync_remote=True,
+        )
+
+        # Alter prompt on disk
+        with open(prompt_file, "w", encoding="utf-8") as f:
+            f.write("template: Modified Prompt Template v2 (Changed!)")
+
+        modified_prompt_hash = JobManifestManager.compute_live_prompt_hash(prompt_folder=prompt_dir)
+        self.assertNotEqual(initial_prompt_hash, modified_prompt_hash)
+
+        # Attempt resume with modified prompt hash -> Must raise IncompatibleResumeError!
+        with self.assertRaises(IncompatibleResumeError) as ctx:
+            self.ckpt_mgr.reconcile_and_resume_job(
+                job_id="prompt_mod_test_job",
+                target_pipeline="example-pipeline",
+                target_prompt_hash=modified_prompt_hash,
+            )
+        self.assertIn("prompt_config_hash changed", str(ctx.exception))
+
     @patch("tasks.CheckpointManager")
     @patch("tasks.redis_client")
     def test_concurrency_lock_prevents_simultaneous_resumes(self, mock_redis, mock_ckpt_cls):
