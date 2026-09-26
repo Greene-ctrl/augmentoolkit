@@ -43,6 +43,59 @@ class CheckpointPolicy:
         return False
 
 
+def split_large_jsonl(
+    fpath: str,
+    max_bytes_per_shard: int = 50 * 1024 * 1024,
+    max_records_per_shard: int = 5000,
+) -> List[str]:
+    """
+    Streams a large .jsonl file line-by-line and splits it into deterministic bounded shard files
+    if size or record count exceeds limits. Deletes original file and returns list of created part file paths.
+    """
+    if not fpath.endswith(".jsonl") or not os.path.exists(fpath):
+        return [fpath]
+
+    file_size = os.path.getsize(fpath)
+    if file_size <= max_bytes_per_shard:
+        return [fpath]
+
+    created_parts = []
+    base_dir = os.path.dirname(fpath)
+    stem = os.path.basename(fpath)[:-6]  # strip .jsonl
+
+    part_idx = 0
+    current_records = 0
+    current_bytes = 0
+    current_part_path = os.path.join(base_dir, f"{stem}_part{part_idx:03d}.jsonl")
+    current_file = open(current_part_path, "w", encoding="utf-8")
+    created_parts.append(current_part_path)
+
+    with open(fpath, "r", encoding="utf-8", errors="replace") as src:
+        for line in src:
+            line_bytes = len(line.encode("utf-8"))
+            if (current_bytes + line_bytes > max_bytes_per_shard or current_records >= max_records_per_shard) and current_records > 0:
+                current_file.close()
+                part_idx += 1
+                current_records = 0
+                current_bytes = 0
+                current_part_path = os.path.join(base_dir, f"{stem}_part{part_idx:03d}.jsonl")
+                current_file = open(current_part_path, "w", encoding="utf-8")
+                created_parts.append(current_part_path)
+
+            current_file.write(line)
+            current_records += 1
+            current_bytes += line_bytes
+
+    current_file.close()
+
+    try:
+        os.remove(fpath)
+    except Exception as e:
+        logger.warning(f"Could not remove original large file {fpath}: {e}")
+
+    return created_parts
+
+
 class CheckpointManager:
     """Coordinates remote-first checkpoint persistence, state hydration, corruption verification, stage/shard tracking, and job recovery."""
 
@@ -79,7 +132,7 @@ class CheckpointManager:
         wk_repo = work_repo or self.hf_manager.work_repo
         out_repo = output_repo or self.hf_manager.output_repo
 
-        config_hash = compute_hash(config_dict or {})
+        config_hash = JobManifestManager.canonical_generation_spec_hash(config_dict or {})
 
         manifest = JobManifest(
             job_id=job_id,
@@ -385,11 +438,13 @@ class CheckpointManager:
         sync_remote: bool = True,
         log_file_path: Optional[str] = None,
         max_bytes_per_shard: int = 50 * 1024 * 1024,  # 50MB max shard size
+        max_records_per_shard: int = 5000,
     ) -> str:
         """
         Incremental sharded finalization (NO whole dataset in RAM!):
-        1. Reconciles already uploaded shards recorded in manifest.output_shards and skips valid uploaded shards.
-        2. Splits large output files if needed.
+        1. Splits large .jsonl files line-by-line by size/record count before uploading.
+           (Note: single-file upload is preserved for .json or .parquet files that cannot be safely line-split).
+        2. Reconciles already uploaded shards recorded in manifest.output_shards and skips valid uploaded shards on retry.
         3. Uploads each un-uploaded shard immediately to HF_OUTPUT_REPO and records shard entry in work manifest immediately after each upload.
         """
         job_id = manifest.job_id
@@ -399,6 +454,14 @@ class CheckpointManager:
         already_uploaded_paths = {s["path_in_repo"]: s["sha256"] for s in manifest.output_shards}
         latest_commit_sha = manifest.final_output_revision or "local_only"
 
+        # First pass: split large .jsonl files if needed
+        for root, _, files in sorted(os.walk(output_dir)):
+            for fname in sorted(files):
+                if fname.endswith(".jsonl") and not "_part" in fname:
+                    fpath = os.path.join(root, fname)
+                    split_large_jsonl(fpath, max_bytes_per_shard=max_bytes_per_shard, max_records_per_shard=max_records_per_shard)
+
+        # Second pass: upload each shard
         for root, _, files in sorted(os.walk(output_dir)):
             for fname in sorted(files):
                 if fname.endswith((".jsonl", ".parquet", ".json")):

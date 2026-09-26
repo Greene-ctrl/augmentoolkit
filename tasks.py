@@ -23,6 +23,7 @@ from augmentoolkit.hf_persistence import (
     HFHubManager,
     CheckpointManager,
     JobManifest,
+    JobManifestManager,
     HFHubError,
 )
 
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
 
 PIPELINE_RUNNER_SCRIPT = "run_augmentoolkit.py"
 ATK3_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+SUPER_CONFIG_PATH = os.path.join(ATK3_DIRECTORY, "super_config.yaml")
 LOGS_DIR = os.path.join(ATK3_DIRECTORY, "logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
 
@@ -72,6 +74,44 @@ def find_first_output_dir(
                 if found is not None:
                     return found
     return None
+
+
+def resolve_job_output_dir(
+    node_path: str,
+    config_path: Optional[str] = None,
+    parameters: Optional[Dict[str, Any]] = None,
+    durable_job_id: Optional[str] = None,
+) -> str:
+    """Resolves the exact absolute output_dir for a job based on parameters or pipeline config."""
+    params = parameters or {}
+    output_dir_value = None
+
+    if "output_dir" in params:
+        output_dir_value = params["output_dir"]
+    elif config_path:
+        try:
+            if os.path.exists(SUPER_CONFIG_PATH):
+                with open(SUPER_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    super_config = yaml.safe_load(f)
+                path_aliases = super_config.get("path_aliases", {})
+                resolved_config_from_alias = resolve_path(config_path, path_aliases)
+                abs_config_path = Path(ATK3_DIRECTORY) / resolved_config_from_alias
+                if abs_config_path.is_file():
+                    with open(abs_config_path, "r", encoding="utf-8") as f:
+                        config_data = yaml.safe_load(f)
+                    if config_data:
+                        output_dir_value = find_first_output_dir(config_data)
+        except Exception as e:
+            logger.warning(f"Error resolving config output_dir: {e}")
+
+    if output_dir_value and isinstance(output_dir_value, str):
+        output_dir_path = Path(output_dir_value)
+        return str(output_dir_path if output_dir_path.is_absolute() else (Path(ATK3_DIRECTORY) / output_dir_value).resolve())
+
+    job_id_str = durable_job_id or params.get("job_id") or params.get("task_id") or "default_job"
+    fallback_dir = (Path(ATK3_DIRECTORY) / "outputs" / job_id_str).resolve()
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    return str(fallback_dir)
 
 
 def set_final_status(
@@ -208,6 +248,14 @@ def run_pipeline_task(
     parameters_flat["task_id"] = task_id
     parameters_flat["job_id"] = durable_job_id
 
+    resolved_output_dir = resolve_job_output_dir(
+        node_path=node_path,
+        config_path=config_path,
+        parameters=parameters_flat,
+        durable_job_id=durable_job_id,
+    )
+    parameters_flat["output_dir"] = resolved_output_dir
+
     hf_source_repo = parameters_flat.get("hf_source_repo") or os.environ.get("HF_SOURCE_REPO", "")
     hf_work_repo = parameters_flat.get("hf_work_repo") or os.environ.get("HF_WORK_REPO", "")
     hf_output_repo = parameters_flat.get("hf_output_repo") or os.environ.get("HF_OUTPUT_REPO", "")
@@ -238,13 +286,25 @@ def run_pipeline_task(
             set_final_status(task_id, "FAILED", msg, details={"error": str(src_e)})
             raise HFHubError(msg) from src_e
 
-    # Initialize/Recover remote JobManifest - FAIL CLOSED if work repo is set and upload/verification fails!
+    # Initialize/Recover remote JobManifest and hydrate remote checkpoints into output_dir!
     manifest: Optional[JobManifest] = None
     if hf_work_repo:
         try:
             existing_manifest = ckpt_mgr.load_remote_manifest(job_id=durable_job_id, work_repo=hf_work_repo)
             if existing_manifest:
-                manifest = existing_manifest
+                # Reconcile and hydrate checkpoints into local resolved_output_dir
+                reconciled_manifest, valid_shards, restored_data = ckpt_mgr.reconcile_and_resume_job(
+                    job_id=durable_job_id,
+                    target_pipeline=node_path,
+                    target_config_dict=parameters_flat,
+                    target_source_repo=hf_source_repo,
+                    target_source_revision=source_revision,
+                    target_source_path=source_path,
+                    target_source_split=source_split,
+                    work_repo=hf_work_repo,
+                    output_dir=resolved_output_dir,
+                )
+                manifest = reconciled_manifest
                 manifest.assign_task_id(task_id)
                 manifest.set_status("RUNNING")
             else:
@@ -264,7 +324,7 @@ def run_pipeline_task(
                 manifest.set_status("RUNNING")
 
             ckpt_mgr.save_manifest_remote(manifest)
-            print(f"Job {durable_job_id}: Manifest initialized/updated and verified on {hf_work_repo}")
+            print(f"Job {durable_job_id}: Manifest initialized/updated and hydrated into '{resolved_output_dir}'")
         except Exception as manifest_e:
             heartbeat.stop()
             release_owned_job_lock(durable_job_id, task_id)
@@ -274,35 +334,6 @@ def run_pipeline_task(
             raise HFHubError(msg) from manifest_e
 
     try:
-        output_dir_value = None
-        resolved_output_dir = None
-
-        with open("super_config.yaml", "r", encoding="utf-8") as f:
-            super_config = yaml.safe_load(f)
-        path_aliases = super_config.get("path_aliases", {})
-
-        if "output_dir" in parameters_flat:
-            output_dir_value = parameters_flat["output_dir"]
-        elif config_path:
-            try:
-                resolved_config_from_alias = resolve_path(config_path, path_aliases)
-                abs_config_path = Path(ATK3_DIRECTORY) / resolved_config_from_alias
-                if abs_config_path.is_file():
-                    with open(abs_config_path, "r", encoding="utf-8") as f:
-                        config_data = yaml.safe_load(f)
-                    if config_data:
-                        output_dir_value = find_first_output_dir(config_data)
-            except Exception as e:
-                print(f"Job {durable_job_id}: Error resolving config output_dir: {e}")
-
-        if output_dir_value and isinstance(output_dir_value, str):
-            output_dir_path = Path(output_dir_value)
-            resolved_output_dir = output_dir_path if output_dir_path.is_absolute() else (Path(ATK3_DIRECTORY) / output_dir_value).resolve()
-        else:
-            resolved_output_dir = (Path(ATK3_DIRECTORY) / "outputs" / durable_job_id).resolve()
-            resolved_output_dir.mkdir(parents=True, exist_ok=True)
-            parameters_flat["output_dir"] = str(resolved_output_dir)
-
         if resolved_output_dir:
             try:
                 redis_client.set(redis_output_dir_key, str(resolved_output_dir), ex=OUTPUT_DIR_MAPPING_TIMEOUT)

@@ -44,7 +44,7 @@ Generation jobs maintain a strict separation between identifiers:
 
 ### Atomic Owned Locks & Heartbeat Lease Renewal
 - Concurrent resume executions for the same durable `job_id` are prevented using atomic Redis locks (`SET durable_job_lock:<job_id> <task_id> NX PX 43200000`).
-- Long-running jobs run a background heartbeat thread that periodically extends the lease in Redis as long as ownership matches `task_id`.
+- Long-running jobs run a background heartbeat thread (`JobLockHeartbeat`) that periodically extends the lease in Redis as long as ownership matches `task_id`.
 - Releasing the lock uses a Lua script that verifies the lock value still equals `task_id` before deleting it, preventing accidental lock releases across task boundaries.
 
 ---
@@ -58,7 +58,7 @@ The manifest records:
 - `pipeline`: Pipeline alias/node path (e.g., `factual-datagen-pipeline`).
 - `source_repo`, `source_revision`, `source_path`, `source_split`: Source document reference.
 - `work_repo` & `output_repo`: References to intermediate work and output repositories.
-- `configuration_hash`: Deterministic SHA256 hash of the canonical generation specification (stripping runtime fields like `task_id`, `job_id`, `output_dir`, `input_dir`, `restored_shards`, etc.).
+- `configuration_hash`: Deterministic SHA256 hash of the canonical generation specification (stripping runtime fields like `task_id`, `job_id`, `output_dir`, `input_dir`, `restored_shards`, `hf_*_repo`, etc.).
 - `prompt_config_hash`: SHA256 hash computed from live prompt files on disk.
 - `output_schema_version`: Version string for target output format.
 - `code_revision`: Git commit SHA or version string of Augmentoolkit.
@@ -82,7 +82,7 @@ Checkpoint persistence is **remote-first**:
 5. **Fail-Closed Semantics**: If `HF_WORK_REPO` is configured and initial manifest creation, checkpoint upload, or remote verification fails, the job fails closed immediately. It does **not** start subprocesses without confirmed persistence.
 
 ### Local State Hydration on Resume
-When recovering a job on a fresh filesystem, `reconcile_and_resume_job` downloads remote checkpoints and hydrates them directly into the job's target local `output_dir` (e.g. `<output_dir>/<shard_id>.json`). When `PipelineStep.execute_pipeline` runs, `PipelineStep.load_dataset` finds the hydrated JSON files on disk and `read_previous_output` skips every record that was already completed!
+When recovering a job on a fresh filesystem, `reconcile_and_resume_job` downloads remote checkpoints from `HF_WORK_REPO` and hydrates them directly into the job's target local `output_dir` (e.g. `<output_dir>/<shard_id>.json`). When `PipelineStep.execute_pipeline` runs, `PipelineStep.load_dataset` finds the hydrated JSON files on disk and `read_previous_output` skips every record that was already completed!
 
 ### Corruption Safeguards
 Upon recovery, downloaded remote checkpoints are verified against recorded SHA256 checksums and JSON integrity. Any corrupted or hash-invalid checkpoint is automatically evicted from `completed_shards` so only that shard is re-executed.
@@ -92,7 +92,7 @@ Upon recovery, downloaded remote checkpoints are verified against recorded SHA25
 ## 6. Incremental Sharded Output Finalization
 
 Dataset output finalization streams results directly to `HF_OUTPUT_REPO` without loading full datasets into RAM:
-1. `finalize_job_sharded` scans the job's `output_dir` for output files (`.jsonl`, `.parquet`, `.json`).
+1. `finalize_job_sharded` scans the job's `output_dir` for output files (`.jsonl`, `.parquet`, `.json`). Large `.jsonl` files are split line-by-line into deterministic bounded shard files (`_part000.jsonl`, `_part001.jsonl`). (Single-file upload is preserved for `.json` or `.parquet` files that cannot be safely line-split).
 2. Reconciles previously uploaded shards recorded in `manifest.output_shards` by path and SHA256 hash, skipping valid already-uploaded shards on retry.
 3. Immediately uploads un-uploaded shards to `HF_OUTPUT_REPO` and records each shard in the manifest in `HF_WORK_REPO` after each upload.
 4. Task status in Redis is set to `COMPLETED` **only after** all HF output shards and manifest uploads succeed.

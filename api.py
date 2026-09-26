@@ -34,6 +34,7 @@ from huey_config import huey
 from tasks import (
     run_pipeline_task,
     set_final_status,
+    resolve_job_output_dir,
 )
 from huey.exceptions import (
     HueyException,
@@ -64,6 +65,7 @@ from file_operation_helpers import (
 from augmentoolkit.hf_persistence import (
     HFHubManager,
     CheckpointManager,
+    JobManifestManager,
     IncompatibleResumeError,
     JobManifest,
 )
@@ -324,18 +326,31 @@ def resume_job(job_id: str, parameters: Optional[Dict[str, Any]] = Body(None)):
     if not manifest:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found in {work_repo}.")
 
+    target_output_dir = resolve_job_output_dir(
+        node_path=manifest.pipeline,
+        config_path=parameters.get("config_path") if parameters else None,
+        parameters=parameters,
+        durable_job_id=job_id,
+    )
+
+    live_prompt_hash = JobManifestManager.compute_live_prompt_hash(
+        prompt_folder=parameters.get("prompt_folder") if parameters else None,
+        default_prompt_folder=parameters.get("default_prompt_folder") if parameters else None,
+    )
+
     try:
         reconciled_manifest, completed_shards, restored_data = ckpt_mgr.reconcile_and_resume_job(
             job_id=job_id,
             target_pipeline=manifest.pipeline,
             target_config_dict=parameters or {},
-            target_prompt_hash=manifest.prompt_config_hash,
+            target_prompt_hash=live_prompt_hash,
             target_source_repo=manifest.source_repo,
             target_source_revision=manifest.source_revision,
             target_source_path=manifest.source_path,
             target_source_split=manifest.source_split,
             target_output_schema_version=manifest.output_schema_version,
             work_repo=work_repo,
+            output_dir=target_output_dir,
         )
     except IncompatibleResumeError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -345,6 +360,7 @@ def resume_job(job_id: str, parameters: Optional[Dict[str, Any]] = Body(None)):
     run_params = parameters or {}
     run_params.update({
         "job_id": job_id,
+        "output_dir": target_output_dir,
         "hf_source_repo": manifest.source_repo,
         "hf_work_repo": manifest.work_repo,
         "hf_output_repo": manifest.output_repo,
@@ -359,6 +375,7 @@ def resume_job(job_id: str, parameters: Optional[Dict[str, Any]] = Body(None)):
     return {
         "job_id": job_id,
         "task_id": task.id,
+        "output_dir": target_output_dir,
         "message": f"Resume task for durable job '{job_id}' enqueued successfully.",
         "completed_shards": list(completed_shards),
     }
