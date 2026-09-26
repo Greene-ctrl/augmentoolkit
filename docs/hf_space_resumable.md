@@ -36,51 +36,75 @@ Configure the following secrets/variables in your Hugging Face Space settings:
 
 ---
 
-## 3. Job Manifest & Durable State
+## 3. Durable Job ID vs. Ephemeral Task ID
+
+Generation jobs maintain a strict separation between identifiers:
+- **Durable `job_id`**: Identifies the dataset generation run across Space restarts, process terminations, and resume attempts.
+- **Ephemeral `task_id`**: Assigned by the Huey task queue for a specific execution attempt.
+
+When a job is resumed via `/jobs/{job_id}/resume` or auto-resume, the execution continues the existing manifest under the same durable `job_id`, appending the new Huey `task_id` to `task_history`. Active execution locks in Redis prevent duplicate concurrent execution of the same durable job.
+
+---
+
+## 4. Job Manifest & Durable State
 
 For every pipeline run, a durable job manifest JSON is maintained in `HF_WORK_REPO` under `jobs/{job_id}/manifest.json`.
 
 The manifest records:
-- `job_id`: Unique identifier for the generation job.
+- `job_id` & `current_task_id`: Durable job identifier and current execution task ID.
 - `pipeline`: Pipeline alias/node path (e.g., `factual-datagen-pipeline`).
 - `source_repo`, `source_revision`, `source_path`, `source_split`: Source document reference.
-- `work_repo`: Reference to intermediate work repository.
-- `output_repo`: Reference to final output dataset repository.
+- `work_repo` & `output_repo`: References to intermediate work and output repositories.
 - `configuration_hash`: SHA256 hash of merged/flattened configuration parameters.
 - `prompt_config_hash`: SHA256 hash of pipeline prompt templates.
+- `output_schema_version`: Version string for target output format.
 - `code_revision`: Git commit SHA or version string of Augmentoolkit.
 - `current_stage` & `current_shard`: Current stage and work unit index.
 - `completed_shards`: List of confirmed completed work units.
+- `checkpoints_metadata`: SHA256 checksums, byte sizes, and record counts for all completed shards.
+- `output_shards`: Metadata for incrementally uploaded output shards.
 - `status`: Job status (`PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `REVOKED`).
 - `timestamps`: Timestamps for creation, last update, and completion.
 - `final_output_revision`: Commit SHA of final dataset in `HF_OUTPUT_REPO`.
 
 ---
 
-## 4. Remote-First Checkpointing & Fail-Closed Semantics
+## 5. Remote-First Checkpointing & Fail-Closed Semantics
 
 Checkpoint persistence is **remote-first**:
 1. Intermediate step outputs and shard results are saved locally in temporary JSON files.
-2. The checkpoint file and updated `manifest.json` are uploaded immediately to `HF_WORK_REPO`.
+2. The checkpoint file (with computed SHA256 checksum) and updated `manifest.json` are uploaded immediately to `HF_WORK_REPO`.
 3. **Verification**: The system verifies remote existence on Hugging Face Hub before marking the checkpoint durable in the manifest.
 4. **Local Cleanup**: Temporary local files are deleted **only after** successful remote confirmation.
-5. **Fail-Closed Behavior**: If remote checkpoint upload or verification fails, the job fails closed (marks state `FAILED` and raises an exception) rather than silently continuing or incorrectly marking work complete.
+5. **Fail-Closed Semantics**: If `HF_WORK_REPO` is configured and initial manifest creation, checkpoint upload, or remote verification fails, the job fails closed immediately. It does **not** downgrade errors to warnings or start subprocesses without confirmed persistence.
+
+### Corruption Safeguards
+Upon recovery, downloaded remote checkpoints are verified against recorded SHA256 checksums and JSON integrity. Any corrupted or hash-invalid checkpoint is automatically evicted from `completed_shards` so only that shard is re-executed.
 
 ---
 
-## 5. Stage/Shard Resumability & Recovery
+## 6. Stage/Shard Resumability & Recovery
 
 Jobs are partitioned into deterministic work units/shards:
 - **Completed Shards**: Listed in `completed_shards` in `manifest.json`. After a Space restart, completed shards are **never regenerated**.
-- **Partially Completed Shards**: Resumed from the latest usable checkpoint if supported; otherwise, only that specific work unit is restarted (not the entire dataset).
-- **Startup Reconciliation**:
-  1. On startup, the API connects to `HF_WORK_REPO` and discovers incomplete jobs (`PENDING`, `RUNNING`, `INTERRUPTED`).
-  2. The system checks compatibility between the remote manifest and target run parameters.
-  3. **Incompatible Resumes**: Continuation is refused if `source_revision`, `configuration_hash`, `prompt_config_hash`, or `code_revision` materially changed. A new or forked run is required instead of mixing incompatible generations.
+- **Partially Completed Shards**: Resumed from the latest usable checkpoint if supported; otherwise, only that specific work unit is restarted.
+- **Incompatible Resumes**: Continuation is automatically blocked if `source_repo`, `source_revision`, `source_path`, `source_split`, `configuration_hash`, `prompt_config_hash`, `output_schema_version`, or `code_revision` materially changed.
+- **Forking Incompatible Jobs**: Use `POST /jobs/{job_id}/fork` to spawn a new durable job with modified parameters rather than mixing incompatible outputs.
 
 ---
 
-## 6. Launching and Managing Jobs via API
+## 7. Work Loss Estimates & Non-Resumable Boundaries
+
+### Granularity & Resumability Boundaries
+- **Fully Restart-Safe**: Stage boundaries, completed shards, and verified checkpoints.
+- **Within a Work Unit**: Individual LLM API calls within an active uncheckpointed batch/shard are executed concurrently. If a hard Space termination occurs mid-shard, in-flight API calls that were not yet committed to a confirmed checkpoint will be re-executed when that shard restarts.
+
+### Maximum Expected Work Lost
+- **Worst-case loss on Space crash**: At most **1 active shard** or **1 micro-checkpoint interval** (e.g. ~10 minutes or 100 records, depending on configured policy). All previously verified shards remain fully intact in `HF_WORK_REPO`.
+
+---
+
+## 8. Launching and Managing Jobs via API
 
 ### Launch a New Pipeline Job
 ```bash
@@ -90,6 +114,7 @@ curl -X POST "https://<your-space>.hf.space/pipelines/run" \
            "node_path": "factual-datagen-pipeline",
            "config_path": "external:_START_HERE_complete_factual.yaml",
            "parameters": {
+             "job_id": "custom_job_001",
              "hf_source_repo": "your-org/private-source",
              "hf_work_repo": "your-org/private-work",
              "hf_output_repo": "your-org/private-output",
@@ -125,4 +150,13 @@ curl "https://<your-space>.hf.space/jobs/<job_id>/outputs"
 curl -X POST "https://<your-space>.hf.space/jobs/<job_id>/resume" \
      -H "Content-Type: application/json" \
      -d '{}'
+```
+
+### Fork a Job for Modified Parameters
+```bash
+curl -X POST "https://<your-space>.hf.space/jobs/<job_id>/fork?new_job_id=custom_fork_001" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "source_revision": "v2.0"
+         }'
 ```

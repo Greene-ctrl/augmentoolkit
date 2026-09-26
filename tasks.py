@@ -40,6 +40,7 @@ PID_KEY_TIMEOUT = 24 * 60 * 60  # 24 hours
 OUTPUT_DIR_MAPPING_TIMEOUT = PID_KEY_TIMEOUT * 7
 PARAMETERS_TIMEOUT = OUTPUT_DIR_MAPPING_TIMEOUT
 FINAL_STATUS_TIMEOUT = OUTPUT_DIR_MAPPING_TIMEOUT
+JOB_LOCK_TIMEOUT = 12 * 60 * 60  # 12 hours
 
 
 def find_first_output_dir(
@@ -90,36 +91,51 @@ def run_pipeline_task(
     parameters: Optional[Dict[str, Any]] = None,
 ):
     """
-    Executes a pipeline via a subprocess, manages Hugging Face Hub persistence (source, work, output repos),
-    stores subprocess PID and parameters, and records durable job manifests and checkpoints.
+    Executes a pipeline via a subprocess with explicit subprocess environment context,
+    managing separate durable job_id and ephemeral Huey task_id, fail-closed remote persistence,
+    and incremental sharded dataset uploading.
     """
     task_id = str(task.id)
+    if parameters is None:
+        parameters = {}
+
+    # Separate durable job_id from ephemeral Huey task_id
+    durable_job_id = str(parameters.get("job_id") or parameters.get("task_id") or task_id)
+
     redis_pid_key = f"worker_pid_for_task:{task_id}"
     redis_output_dir_key = f"output_dir_for_task:{task_id}"
     redis_params_key = f"parameters_for_task:{task_id}"
     redis_status_key = f"status_for_task:{task_id}"
+    job_lock_key = f"active_lock_for_job:{durable_job_id}"
+
+    # Lock to prevent duplicate concurrent runs for the same durable job_id
+    current_lock = redis_client.get(job_lock_key)
+    if current_lock and current_lock.decode("utf-8") != task_id:
+        active_task = current_lock.decode("utf-8")
+        msg = f"Job '{durable_job_id}' is already actively executing under Huey task ID '{active_task}'. Duplicate execution rejected."
+        logger.error(msg)
+        set_final_status(task_id, "FAILED", msg, details={"error": "duplicate_job_execution"})
+        raise RuntimeError(msg)
+
+    redis_client.set(job_lock_key, task_id, ex=JOB_LOCK_TIMEOUT)
+
     process = None
     log_file: Optional[io.TextIOWrapper] = None
     log_file_path = ""
     final_status_set = False
 
-    os.environ["JOB_ID"] = task_id
-    os.environ["TASK_ID"] = task_id
-
-    print(f"Task {task_id}: Preparing to run pipeline subprocess for node: {node_path}")
+    print(f"Task {task_id} (Durable Job ID: {durable_job_id}): Preparing pipeline subprocess for node: {node_path}")
 
     try:
-        set_progress(task_id, 0.0, "Initializing task...")
+        set_progress(task_id, 0.0, f"Initializing task for job {durable_job_id}...")
     except Exception as e:
         print(f"Task {task_id}: Failed to set initial progress: {e}")
-
-    if parameters is None:
-        parameters = {}
 
     no_flatten_keys = parameters.get("no_flatten", [])
     try:
         parameters_flat = flatten_config(parameters, no_flatten_keys=no_flatten_keys)
     except Exception as fc_e:
+        redis_client.delete(job_lock_key)
         set_final_status(
             task_id,
             "FAILED",
@@ -128,10 +144,9 @@ def run_pipeline_task(
         )
         raise
 
-    if "task_id" not in parameters_flat:
-        parameters_flat["task_id"] = task_id
+    parameters_flat["task_id"] = task_id
+    parameters_flat["job_id"] = durable_job_id
 
-    # --- HF Hub Repos & Source Handling ---
     hf_source_repo = parameters_flat.get("hf_source_repo") or os.environ.get("HF_SOURCE_REPO", "")
     hf_work_repo = parameters_flat.get("hf_work_repo") or os.environ.get("HF_WORK_REPO", "")
     hf_output_repo = parameters_flat.get("hf_output_repo") or os.environ.get("HF_OUTPUT_REPO", "")
@@ -145,7 +160,7 @@ def run_pipeline_task(
     # Pull source subset from HF_SOURCE_REPO if configured
     if hf_source_repo and source_path:
         try:
-            print(f"Task {task_id}: Downloading source path '{source_path}' from {hf_source_repo} (revision: {source_revision})...")
+            print(f"Job {durable_job_id}: Downloading source path '{source_path}' from {hf_source_repo} (revision: {source_revision})...")
             local_inputs_target = os.path.join(ATK3_DIRECTORY, "inputs", source_path)
             ckpt_mgr.hf_manager.download_folder(
                 path_in_repo=source_path,
@@ -153,42 +168,51 @@ def run_pipeline_task(
                 repo_id=hf_source_repo,
                 revision=source_revision,
             )
-            print(f"Task {task_id}: Source download complete.")
+            print(f"Job {durable_job_id}: Source download complete.")
         except Exception as src_e:
-            print(f"Task {task_id}: Failed to download source from {hf_source_repo}: {src_e}")
-            set_final_status(
-                task_id,
-                "FAILED",
-                f"Failed to download source input from HF Hub: {src_e}",
-                details={"error": str(src_e)},
-            )
-            raise
+            redis_client.delete(job_lock_key)
+            msg = f"Failed to download source input from HF Hub for job {durable_job_id}: {src_e}"
+            logger.error(msg)
+            set_final_status(task_id, "FAILED", msg, details={"error": str(src_e)})
+            raise HFHubError(msg) from src_e
 
-    # Initialize remote JobManifest
+    # Initialize/Recover remote JobManifest - FAIL CLOSED if work repo is set and upload/verification fails!
     manifest: Optional[JobManifest] = None
     if hf_work_repo:
-        os.environ["HF_WORK_REPO"] = hf_work_repo
         try:
-            manifest = ckpt_mgr.init_job_manifest(
-                job_id=task_id,
-                pipeline=node_path,
-                source_repo=hf_source_repo,
-                source_revision=source_revision,
-                source_path=source_path,
-                source_split=source_split,
-                work_repo=hf_work_repo,
-                output_repo=hf_output_repo,
-                config_dict=parameters_flat,
-                sync_remote=True,
-            )
-            manifest.set_status("RUNNING")
+            existing_manifest = ckpt_mgr.load_remote_manifest(job_id=durable_job_id, work_repo=hf_work_repo)
+            if existing_manifest:
+                manifest = existing_manifest
+                manifest.assign_task_id(task_id)
+                manifest.set_status("RUNNING")
+            else:
+                manifest = ckpt_mgr.init_job_manifest(
+                    job_id=durable_job_id,
+                    pipeline=node_path,
+                    source_repo=hf_source_repo,
+                    source_revision=source_revision,
+                    source_path=source_path,
+                    source_split=source_split,
+                    work_repo=hf_work_repo,
+                    output_repo=hf_output_repo,
+                    config_dict=parameters_flat,
+                    sync_remote=False,
+                )
+                manifest.assign_task_id(task_id)
+                manifest.set_status("RUNNING")
+
+            # Persist and verify manifest upload strictly before proceeding
             ckpt_mgr.save_manifest_remote(manifest)
-            print(f"Task {task_id}: Initialized and uploaded remote job manifest to {hf_work_repo}")
+            print(f"Job {durable_job_id}: Manifest initialized/updated and verified on {hf_work_repo}")
         except Exception as manifest_e:
-            print(f"Task {task_id}: Warning: Failed to sync initial manifest: {manifest_e}")
+            redis_client.delete(job_lock_key)
+            msg = f"Fail-closed: Manifest creation or remote sync failed for job {durable_job_id} on repo {hf_work_repo}: {manifest_e}"
+            logger.error(msg)
+            set_final_status(task_id, "FAILED", msg, details={"error": str(manifest_e)})
+            raise HFHubError(msg) from manifest_e
 
     try:
-        # --- Determine and Store Output Directory ---
+        # Determine output directory
         output_dir_value = None
         resolved_output_dir = None
 
@@ -208,13 +232,13 @@ def run_pipeline_task(
                     if config_data:
                         output_dir_value = find_first_output_dir(config_data)
             except Exception as e:
-                print(f"Task {task_id}: Error resolving config path output_dir: {e}")
+                print(f"Job {durable_job_id}: Error resolving config output_dir: {e}")
 
         if output_dir_value and isinstance(output_dir_value, str):
             output_dir_path = Path(output_dir_value)
             resolved_output_dir = output_dir_path if output_dir_path.is_absolute() else (Path(ATK3_DIRECTORY) / output_dir_value).resolve()
         else:
-            resolved_output_dir = (Path(ATK3_DIRECTORY) / "outputs" / task_id).resolve()
+            resolved_output_dir = (Path(ATK3_DIRECTORY) / "outputs" / durable_job_id).resolve()
             resolved_output_dir.mkdir(parents=True, exist_ok=True)
             parameters_flat["output_dir"] = str(resolved_output_dir)
 
@@ -230,6 +254,14 @@ def run_pipeline_task(
             redis_client.set(redis_params_key, params_json, ex=PARAMETERS_TIMEOUT)
         except Exception as e:
             print(f"Task {task_id}: Failed to store parameters in Redis: {e}")
+
+        # Construct explicit environment dict for subprocess
+        sub_env = os.environ.copy()
+        sub_env["JOB_ID"] = durable_job_id
+        sub_env["TASK_ID"] = task_id
+        sub_env["HF_WORK_REPO"] = hf_work_repo
+        sub_env["HF_SOURCE_REPO"] = hf_source_repo
+        sub_env["HF_OUTPUT_REPO"] = hf_output_repo
 
         # Prepare Subprocess Command
         command = [
@@ -257,6 +289,7 @@ def run_pipeline_task(
                 stdout=log_file,
                 stderr=log_file,
                 cwd=ATK3_DIRECTORY,
+                env=sub_env,
             )
         else:
             process = subprocess.Popen(
@@ -264,6 +297,7 @@ def run_pipeline_task(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 cwd=ATK3_DIRECTORY,
+                env=sub_env,
             )
 
         if process is None:
@@ -275,46 +309,27 @@ def run_pipeline_task(
         exit_code = process.wait()
 
         # Sync log file remotely
-        if manifest and log_file_path:
+        if manifest and log_file_path and os.path.exists(log_file_path):
             ckpt_mgr.sync_log_file(manifest, log_file_path)
 
         if exit_code == 0:
-            set_final_status(task_id, "COMPLETED", f"Pipeline task {task_id} completed successfully.")
+            set_final_status(task_id, "COMPLETED", f"Pipeline job {durable_job_id} (task {task_id}) completed successfully.")
             final_status_set = True
 
-            # Finalize output dataset upload to HF_OUTPUT_REPO
+            # Incremental sharded dataset upload to HF_OUTPUT_REPO (NO whole dataset in RAM!)
             if manifest and resolved_output_dir and os.path.exists(resolved_output_dir):
-                final_items = []
-                for root, _, files in os.walk(resolved_output_dir):
-                    for fname in files:
-                        if fname.endswith(".jsonl") or fname.endswith(".json"):
-                            fpath = os.path.join(root, fname)
-                            try:
-                                with open(fpath, "r", encoding="utf-8") as f:
-                                    if fname.endswith(".jsonl"):
-                                        for line in f:
-                                            if line.strip():
-                                                final_items.append(json.loads(line))
-                                    else:
-                                        data = json.load(f)
-                                        if isinstance(data, list):
-                                            final_items.extend(data)
-                                        elif isinstance(data, dict):
-                                            final_items.append(data)
-                            except Exception:
-                                pass
-                if final_items:
-                    out_rev = ckpt_mgr.finalize_job(
-                        manifest=manifest,
-                        final_dataset_items=final_items,
-                        format_type="jsonl",
-                        sync_remote=True,
-                        log_file_path=log_file_path,
-                    )
-                    print(f"Task {task_id}: Uploaded final dataset to {manifest.output_repo} (Commit: {out_rev})")
+                out_rev = ckpt_mgr.finalize_job_sharded(
+                    manifest=manifest,
+                    output_dir=str(resolved_output_dir),
+                    sync_remote=True,
+                    log_file_path=log_file_path,
+                )
+                print(f"Job {durable_job_id}: Incremental sharded finalization uploaded to {manifest.output_repo} (Revision: {out_rev})")
 
             return {
                 "status": "success",
+                "job_id": durable_job_id,
+                "task_id": task_id,
                 "message": f"Pipeline {node_path} completed successfully.",
             }
         else:
@@ -332,7 +347,7 @@ def run_pipeline_task(
                 except Exception:
                     pass
 
-            error_message = f"Task {task_id}: Subprocess failed with exit code {exit_code}."
+            error_message = f"Job {durable_job_id} (task {task_id}): Subprocess failed with exit code {exit_code}."
             if not final_status_set:
                 set_final_status(
                     task_id,
@@ -370,6 +385,7 @@ def run_pipeline_task(
         raise
 
     finally:
+        redis_client.delete(job_lock_key)
         if log_file:
             try:
                 log_file.close()

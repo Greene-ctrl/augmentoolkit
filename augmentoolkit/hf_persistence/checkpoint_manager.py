@@ -11,24 +11,52 @@ from .job_manifest import (
     IncompatibleResumeError,
     JobManifest,
     JobManifestManager,
+    compute_file_hash,
     compute_hash,
 )
 
 logger = logging.getLogger(__name__)
 
 
+class CheckpointPolicy:
+    """Configurable checkpoint policy abstraction."""
+
+    def __init__(
+        self,
+        shard_checkpoint_mandatory: bool = True,
+        record_interval: int = 100,
+        time_interval_minutes: float = 10.0,
+    ):
+        self.shard_checkpoint_mandatory = shard_checkpoint_mandatory
+        self.record_interval = record_interval
+        self.time_interval_seconds = time_interval_minutes * 60.0
+        self.last_checkpoint_time = time.time()
+        self.record_counter = 0
+
+    def should_micro_checkpoint(self, records_added: int = 1) -> bool:
+        self.record_counter += records_added
+        elapsed = time.time() - self.last_checkpoint_time
+        if self.record_counter >= self.record_interval or elapsed >= self.time_interval_seconds:
+            self.record_counter = 0
+            self.last_checkpoint_time = time.time()
+            return True
+        return False
+
+
 class CheckpointManager:
-    """Coordinates remote-first checkpoint persistence, stage/shard tracking, and job recovery."""
+    """Coordinates remote-first checkpoint persistence, corruption verification, stage/shard tracking, and job recovery."""
 
     def __init__(
         self,
         hf_manager: Optional[HFHubManager] = None,
         checkpoint_dir: str = "checkpoints",
         outputs_dir: str = "outputs",
+        policy: Optional[CheckpointPolicy] = None,
     ):
         self.hf_manager = hf_manager or HFHubManager()
         self.checkpoint_dir = checkpoint_dir
         self.outputs_dir = outputs_dir
+        self.policy = policy or CheckpointPolicy()
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         os.makedirs(self.outputs_dir, exist_ok=True)
 
@@ -44,9 +72,9 @@ class CheckpointManager:
         output_repo: Optional[str] = None,
         config_dict: Optional[Dict[str, Any]] = None,
         prompt_config_hash: str = "",
+        output_schema_version: str = "1.0",
         sync_remote: bool = True,
     ) -> JobManifest:
-        """Creates and optionally persists a new job manifest."""
         src_repo = source_repo or self.hf_manager.source_repo
         wk_repo = work_repo or self.hf_manager.work_repo
         out_repo = output_repo or self.hf_manager.output_repo
@@ -64,6 +92,7 @@ class CheckpointManager:
             output_repo=out_repo,
             configuration_hash=config_hash,
             prompt_config_hash=prompt_config_hash,
+            output_schema_version=output_schema_version,
             status="PENDING",
         )
 
@@ -73,7 +102,7 @@ class CheckpointManager:
         return manifest
 
     def save_manifest_remote(self, manifest: JobManifest) -> str:
-        """Saves job manifest locally and uploads to HF_WORK_REPO under jobs/{job_id}/manifest.json."""
+        """Saves job manifest locally and uploads to HF_WORK_REPO. Fails closed if work_repo is set and upload fails."""
         manifest.update_timestamp()
         job_local_dir = os.path.join(self.checkpoint_dir, manifest.job_id)
         os.makedirs(job_local_dir, exist_ok=True)
@@ -83,18 +112,22 @@ class CheckpointManager:
             json.dump(manifest.to_dict(), f, indent=2)
 
         if not manifest.work_repo:
-            logger.warning(f"No work_repo set for job {manifest.job_id}, manifest saved locally only.")
             return "local_only"
 
         path_in_repo = f"jobs/{manifest.job_id}/manifest.json"
-        commit_sha = self.hf_manager.upload_file(
-            local_path=manifest_path,
-            path_in_repo=path_in_repo,
-            repo_id=manifest.work_repo,
-            repo_type="dataset",
-            commit_message=f"Update manifest for job {manifest.job_id} (Status: {manifest.status})",
-        )
-        return commit_sha
+        try:
+            commit_sha = self.hf_manager.upload_file(
+                local_path=manifest_path,
+                path_in_repo=path_in_repo,
+                repo_id=manifest.work_repo,
+                repo_type="dataset",
+                commit_message=f"Update manifest for job {manifest.job_id} (Status: {manifest.status})",
+            )
+            return commit_sha
+        except Exception as e:
+            msg = f"Fail-closed: Manifest creation/sync failed for job {manifest.job_id} on {manifest.work_repo}: {e}"
+            logger.error(msg)
+            raise HFHubError(msg) from e
 
     def save_checkpoint(
         self,
@@ -106,12 +139,12 @@ class CheckpointManager:
         log_file_path: Optional[str] = None,
     ) -> str:
         """
-        Remote-first checkpoint save:
-        1. Writes local checkpoint file.
-        2. Uploads checkpoint file and updated manifest to HF_WORK_REPO.
-        3. Verifies successful remote upload before treating checkpoint as durable.
-        4. Deletes local temporary checkpoint file if remote upload succeeds.
-        Fails closed on remote upload failure.
+        Remote-first checkpoint save with checksum calculation and strict fail-closed verification:
+        1. Writes local checkpoint JSON.
+        2. Computes SHA256 checksum and size metadata.
+        3. Uploads checkpoint file and updated manifest to HF_WORK_REPO.
+        4. Verifies remote file existence.
+        5. Deletes local temporary checkpoint file ONLY after confirmed remote persistence.
         """
         job_id = manifest.job_id
         manifest.current_stage = stage
@@ -123,18 +156,26 @@ class CheckpointManager:
         shard_filename = f"shard_{shard_id}.json"
         local_ckpt_path = os.path.join(local_job_dir, shard_filename)
 
-        # Write local checkpoint
         with open(local_ckpt_path, "w", encoding="utf-8") as f:
             json.dump(checkpoint_data, f, indent=2)
 
+        file_size = os.path.getsize(local_ckpt_path)
+        checksum = compute_file_hash(local_ckpt_path)
+        record_count = len(checkpoint_data) if isinstance(checkpoint_data, (dict, list)) else 1
+
+        manifest.mark_shard_completed(
+            shard_id=shard_id,
+            checksum=checksum,
+            size=file_size,
+            record_count=record_count,
+        )
+
         if not sync_remote or not manifest.work_repo:
             logger.info(f"Checkpoint saved locally for job {job_id}, shard {shard_id}")
-            manifest.mark_shard_completed(shard_id)
             return "local_saved"
 
         repo_ckpt_path = f"jobs/{job_id}/checkpoints/{shard_filename}"
 
-        # Remote upload
         try:
             commit_sha = self.hf_manager.upload_file(
                 local_path=local_ckpt_path,
@@ -144,7 +185,6 @@ class CheckpointManager:
                 commit_message=f"Checkpoint job {job_id} stage {stage} shard {shard_id}",
             )
 
-            # Verification: file must exist on hub
             if not self.hf_manager.file_exists(
                 repo_id=manifest.work_repo, path_in_repo=repo_ckpt_path
             ):
@@ -152,18 +192,13 @@ class CheckpointManager:
                     f"Remote verification failed: Checkpoint {repo_ckpt_path} not found after upload."
                 )
 
-            # Mark completed in manifest and save updated manifest
-            manifest.mark_shard_completed(shard_id)
             self.save_manifest_remote(manifest)
 
-            # Sync logs if provided
             if log_file_path and os.path.exists(log_file_path):
                 self.sync_log_file(manifest, log_file_path)
 
-            # Delete local temp file only after confirmed remote persistence
             try:
                 os.remove(local_ckpt_path)
-                logger.info(f"Deleted local temporary checkpoint after remote verification: {local_ckpt_path}")
             except Exception as e:
                 logger.warning(f"Could not remove local temp checkpoint {local_ckpt_path}: {e}")
 
@@ -180,7 +215,6 @@ class CheckpointManager:
             raise HFHubError(msg) from e
 
     def sync_log_file(self, manifest: JobManifest, log_file_path: str, max_lines: int = 2000):
-        """Uploads bounded/truncated log file to HF_WORK_REPO under jobs/{job_id}/logs/job.log."""
         if not manifest.work_repo or not os.path.exists(log_file_path):
             return
 
@@ -212,7 +246,6 @@ class CheckpointManager:
     def load_remote_manifest(
         self, job_id: str, work_repo: Optional[str] = None
     ) -> Optional[JobManifest]:
-        """Downloads and constructs JobManifest from HF_WORK_REPO."""
         manifest_dict = self.hf_manager.fetch_manifest(job_id=job_id, work_repo=work_repo)
         if manifest_dict:
             return JobManifest.from_dict(manifest_dict)
@@ -224,30 +257,38 @@ class CheckpointManager:
         target_pipeline: str,
         target_config_dict: Optional[Dict[str, Any]] = None,
         target_prompt_hash: str = "",
+        target_source_repo: Optional[str] = None,
         target_source_revision: str = "main",
+        target_source_path: Optional[str] = None,
+        target_source_split: Optional[str] = None,
+        target_output_schema_version: str = "1.0",
         work_repo: Optional[str] = None,
     ) -> Tuple[JobManifest, Set[Union[str, int]], Dict[str, Any]]:
         """
-        Startup/Resume reconciliation:
-        1. Connects to work_repo, fetches remote manifest.
-        2. Validates compatibility against target parameters/hashes.
-        3. Returns (manifest, completed_shards_set, merged_checkpoint_data).
-        Refuses continuation if incompatible.
+        Startup/Resume reconciliation with strict corruption safeguards:
+        1. Fetches remote manifest.
+        2. Validates compatibility against target parameters.
+        3. Downloads and verifies checksum/JSON validity for each shard.
+        4. Corrupted/unreadable/invalid shards are dropped from completed_shards so only those shards re-run.
         """
         existing_manifest = self.load_remote_manifest(job_id=job_id, work_repo=work_repo)
         if not existing_manifest:
             raise ValueError(f"Job manifest for job_id '{job_id}' not found in remote repository.")
 
-        # Construct candidate target manifest to compare compatibility
+        src_repo = target_source_repo or existing_manifest.source_repo
+
         target_manifest = JobManifest(
             job_id=job_id,
             pipeline=target_pipeline,
-            source_repo=existing_manifest.source_repo,
+            source_repo=src_repo,
             source_revision=target_source_revision,
+            source_path=target_source_path or existing_manifest.source_path,
+            source_split=target_source_split or existing_manifest.source_split,
             work_repo=existing_manifest.work_repo,
             output_repo=existing_manifest.output_repo,
             configuration_hash=compute_hash(target_config_dict or {}),
             prompt_config_hash=target_prompt_hash,
+            output_schema_version=target_output_schema_version,
         )
 
         is_compat, mismatches = JobManifestManager.check_compatibility(
@@ -255,19 +296,17 @@ class CheckpointManager:
         )
         if not is_compat:
             reason = "; ".join(mismatches)
-            msg = f"Refusing automatic continuation for job {job_id}: Material inputs changed ({reason}). Required to start new or forked run."
+            msg = f"Refusing automatic continuation for job {job_id}: Material inputs changed ({reason}). Use fork job API or start new run."
             logger.error(msg)
             raise IncompatibleResumeError(msg)
 
-        # Restore completed shard data
-        completed_shards = set(existing_manifest.completed_shards)
+        valid_completed_shards: Set[Union[str, int]] = set()
         restored_data: Dict[str, Any] = {}
 
-        # Download existing remote checkpoints into local checkpoint directory
         job_local_dir = os.path.join(self.checkpoint_dir, job_id)
         os.makedirs(job_local_dir, exist_ok=True)
 
-        for shard_id in completed_shards:
+        for shard_id in list(existing_manifest.completed_shards):
             shard_filename = f"shard_{shard_id}.json"
             repo_ckpt_path = f"jobs/{job_id}/checkpoints/{shard_filename}"
             local_ckpt_path = os.path.join(job_local_dir, shard_filename)
@@ -279,19 +318,38 @@ class CheckpointManager:
                     repo_id=existing_manifest.work_repo,
                     repo_type="dataset",
                 )
+
+                # Checksum verification if available
+                shard_meta = existing_manifest.checkpoints_metadata.get(str(shard_id), {})
+                expected_checksum = shard_meta.get("checksum")
+                if expected_checksum:
+                    actual_checksum = compute_file_hash(local_ckpt_path)
+                    if actual_checksum != expected_checksum:
+                        logger.warning(
+                            f"Corruption detected for job {job_id} shard {shard_id}: Checksum mismatch ({actual_checksum} != {expected_checksum}). Evicting shard to force re-execution."
+                        )
+                        continue
+
                 with open(local_ckpt_path, "r", encoding="utf-8") as f:
                     shard_content = json.load(f)
+                    if not isinstance(shard_content, dict):
+                        logger.warning(f"Corruption detected for job {job_id} shard {shard_id}: content is not a dict. Evicting shard.")
+                        continue
                     restored_data.update(shard_content)
-            except Exception as e:
-                logger.warning(f"Could not download completed shard {shard_id} for job {job_id}: {e}")
 
+                valid_completed_shards.add(shard_id)
+
+            except Exception as e:
+                logger.warning(f"Could not load valid checkpoint for shard {shard_id} of job {job_id}: {e}. Evicting shard from completed set.")
+
+        # Update manifest completed_shards to contain only valid shards
+        existing_manifest.completed_shards = list(valid_completed_shards)
         existing_manifest.status = "RUNNING"
         self.save_manifest_remote(existing_manifest)
 
-        return existing_manifest, completed_shards, restored_data
+        return existing_manifest, valid_completed_shards, restored_data
 
     def discover_incomplete_jobs(self, work_repo: Optional[str] = None) -> List[JobManifest]:
-        """Finds all jobs in work_repo with status PENDING, RUNNING, or INTERRUPTED."""
         job_ids = self.hf_manager.list_jobs(work_repo=work_repo)
         incomplete_manifests = []
 
@@ -302,58 +360,68 @@ class CheckpointManager:
 
         return incomplete_manifests
 
-    def finalize_job(
+    def finalize_job_sharded(
         self,
         manifest: JobManifest,
-        final_dataset_items: List[Dict[str, Any]],
+        output_dir: str,
         format_type: str = "jsonl",
         sync_remote: bool = True,
         log_file_path: Optional[str] = None,
     ) -> str:
         """
-        Writes final generated training data to HF_OUTPUT_REPO (as Parquet/JSONL)
-        and records final output revision in the job manifest.
+        Incremental sharded finalization (NO whole dataset in RAM!):
+        Scans output_dir for output files/shards, uploads each shard incrementally to HF_OUTPUT_REPO,
+        records each shard in manifest.output_shards, and sets manifest status to COMPLETED.
         """
         job_id = manifest.job_id
-        job_out_dir = os.path.join(self.outputs_dir, job_id)
-        os.makedirs(job_out_dir, exist_ok=True)
+        if not os.path.exists(output_dir):
+            raise ValueError(f"Output directory '{output_dir}' does not exist.")
 
-        if format_type.lower() == "jsonl":
-            out_filename = "train.jsonl"
-            out_local_path = os.path.join(job_out_dir, out_filename)
-            with open(out_local_path, "w", encoding="utf-8") as f:
-                for item in final_dataset_items:
-                    f.write(json.dumps(item) + "\n")
-        elif format_type.lower() == "parquet":
-            import pandas as pd
-            out_filename = "train.parquet"
-            out_local_path = os.path.join(job_out_dir, out_filename)
-            df = pd.DataFrame(final_dataset_items)
-            df.to_parquet(out_local_path, index=False)
-        else:
-            out_filename = "data.json"
-            out_local_path = os.path.join(job_out_dir, out_filename)
-            with open(out_local_path, "w", encoding="utf-8") as f:
-                json.dump(final_dataset_items, f, indent=2)
+        latest_commit_sha = "local_only"
 
-        output_commit_sha = "local_only"
-        if sync_remote and manifest.output_repo:
-            repo_path = f"datasets/{job_id}/{out_filename}"
-            output_commit_sha = self.hf_manager.upload_file(
-                local_path=out_local_path,
-                path_in_repo=repo_path,
-                repo_id=manifest.output_repo,
-                repo_type="dataset",
-                commit_message=f"Final output dataset for job {job_id}",
-            )
-            manifest.final_output_revision = output_commit_sha
+        for root, _, files in sorted(os.walk(output_dir)):
+            for fname in sorted(files):
+                if fname.endswith((".jsonl", ".parquet", ".json")):
+                    fpath = os.path.join(root, fname)
+                    rel_path = os.path.relpath(fpath, output_dir)
+                    f_size = os.path.getsize(fpath)
+                    f_hash = compute_file_hash(fpath)
 
+                    # Count records without loading full file into RAM
+                    record_count = 0
+                    if fname.endswith(".jsonl"):
+                        with open(fpath, "r", encoding="utf-8") as f:
+                            record_count = sum(1 for line in f if line.strip())
+                    else:
+                        record_count = 1
+
+                    repo_path = f"datasets/{job_id}/{rel_path}"
+
+                    if sync_remote and manifest.output_repo:
+                        commit_sha = self.hf_manager.upload_file(
+                            local_path=fpath,
+                            path_in_repo=repo_path,
+                            repo_id=manifest.output_repo,
+                            repo_type="dataset",
+                            commit_message=f"Final output shard {rel_path} for job {job_id}",
+                        )
+                        latest_commit_sha = commit_sha
+                        manifest.record_output_shard(
+                            filename=rel_path,
+                            record_count=record_count,
+                            sha256=f_hash,
+                            commit_sha=commit_sha,
+                            path_in_repo=repo_path,
+                        )
+
+        manifest.final_output_revision = latest_commit_sha
         manifest.set_status("COMPLETED")
         manifest.current_stage = "completed"
+
         if sync_remote and manifest.work_repo:
             self.save_manifest_remote(manifest)
 
         if log_file_path and os.path.exists(log_file_path):
             self.sync_log_file(manifest, log_file_path)
 
-        return output_commit_sha
+        return latest_commit_sha

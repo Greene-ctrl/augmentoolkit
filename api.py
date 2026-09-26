@@ -73,7 +73,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# --- Configuration Loading ---
 SUPER_CONFIG_PATH = PyPath("super_config.yaml")
 PATH_ALIASES = {}
 
@@ -101,7 +100,6 @@ CONFIGS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
 
-# --- Pydantic Models ---
 class PipelineRunRequest(BaseModel):
     node_path: str
     config_path: Optional[str] = None
@@ -149,7 +147,6 @@ class TaskParametersResponse(BaseModel):
     parameters: Dict[str, Any]
 
 
-# --- FastAPI App ---
 app = FastAPI(
     title="Augmentoolkit Resumable Dataset Factory API",
     description="API for managing and running Augmentoolkit dataset pipelines with Hugging Face Hub remote persistence.",
@@ -186,11 +183,11 @@ async def startup_event():
             auto_resume = os.environ.get("HF_AUTO_RESUME", "false").lower() in ("true", "1", "yes")
             if auto_resume:
                 for manifest in incomplete_jobs:
-                    logger.info(f"Auto-resuming job {manifest.job_id}...")
+                    logger.info(f"Auto-resuming durable job {manifest.job_id}...")
                     run_pipeline_task(
                         node_path=manifest.pipeline,
                         parameters={
-                            "task_id": manifest.job_id,
+                            "job_id": manifest.job_id,
                             "hf_source_repo": manifest.source_repo,
                             "hf_work_repo": manifest.work_repo,
                             "hf_output_repo": manifest.output_repo,
@@ -243,7 +240,6 @@ async def readiness_check():
 
 @app.get("/api-docs", include_in_schema=False)
 async def api_docs_redirect():
-    """Redirect to API documentation."""
     return RedirectResponse(url="/docs")
 
 
@@ -334,7 +330,11 @@ def resume_job(job_id: str, parameters: Optional[Dict[str, Any]] = Body(None)):
             target_pipeline=manifest.pipeline,
             target_config_dict=parameters or {},
             target_prompt_hash=manifest.prompt_config_hash,
+            target_source_repo=manifest.source_repo,
             target_source_revision=manifest.source_revision,
+            target_source_path=manifest.source_path,
+            target_source_split=manifest.source_split,
+            target_output_schema_version=manifest.output_schema_version,
             work_repo=work_repo,
         )
     except IncompatibleResumeError as e:
@@ -344,7 +344,7 @@ def resume_job(job_id: str, parameters: Optional[Dict[str, Any]] = Body(None)):
 
     run_params = parameters or {}
     run_params.update({
-        "task_id": job_id,
+        "job_id": job_id,
         "hf_source_repo": manifest.source_repo,
         "hf_work_repo": manifest.work_repo,
         "hf_output_repo": manifest.output_repo,
@@ -359,8 +359,48 @@ def resume_job(job_id: str, parameters: Optional[Dict[str, Any]] = Body(None)):
     return {
         "job_id": job_id,
         "task_id": task.id,
-        "message": "Resume task enqueued successfully.",
+        "message": f"Resume task for durable job '{job_id}' enqueued successfully.",
         "completed_shards": list(completed_shards),
+    }
+
+
+@app.post("/jobs/{job_id}/fork", summary="Fork an existing job run into a new durable job")
+def fork_job(
+    job_id: str,
+    new_job_id: Optional[str] = Query(None),
+    parameters: Optional[Dict[str, Any]] = Body(None),
+):
+    work_repo = os.environ.get("HF_WORK_REPO", "")
+    ckpt_mgr = CheckpointManager()
+    parent_manifest = ckpt_mgr.load_remote_manifest(job_id=job_id, work_repo=work_repo)
+    if not parent_manifest:
+        raise HTTPException(status_code=404, detail=f"Parent job '{job_id}' not found in {work_repo}.")
+
+    forked_id = new_job_id or f"{job_id}_fork_{int(time.time())}"
+
+    fork_params = parameters or {}
+    run_params = {
+        "job_id": forked_id,
+        "forked_from_job_id": job_id,
+        "hf_source_repo": fork_params.get("hf_source_repo", parent_manifest.source_repo),
+        "hf_work_repo": work_repo,
+        "hf_output_repo": fork_params.get("hf_output_repo", parent_manifest.output_repo),
+        "source_revision": fork_params.get("source_revision", parent_manifest.source_revision),
+        "source_path": fork_params.get("source_path", parent_manifest.source_path),
+        "source_split": fork_params.get("source_split", parent_manifest.source_split),
+    }
+    run_params.update(fork_params)
+
+    task = run_pipeline_task(
+        node_path=parent_manifest.pipeline,
+        parameters=run_params,
+    )
+
+    return {
+        "forked_job_id": forked_id,
+        "parent_job_id": job_id,
+        "task_id": task.id,
+        "message": "Forked job queued successfully.",
     }
 
 
@@ -658,7 +698,6 @@ def get_config_structure(relative_path: str = "."):
     return handle_get_structure(CONFIGS_DIR, relative_path)
 
 
-# --- Serve Frontend ---
 FRONTEND_DIST_DIR = PyPath("atk-interface/dist")
 
 @app.get("/{full_path:path}", include_in_schema=False)

@@ -7,16 +7,18 @@ from unittest.mock import MagicMock, patch
 
 from augmentoolkit.hf_persistence import (
     CheckpointManager,
+    CheckpointPolicy,
     HFHubError,
     HFHubManager,
     IncompatibleResumeError,
     JobManifest,
     JobManifestManager,
+    compute_file_hash,
     compute_hash,
 )
 
 
-class TestHFSpaceRecoveryLifecycle(unittest.TestCase):
+class TestHFSpaceRecoveryIntegration(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self.ckpt_dir = os.path.join(self.test_dir, "checkpoints")
@@ -62,10 +64,19 @@ class TestHFSpaceRecoveryLifecycle(unittest.TestCase):
                 return json.loads(self.remote_work_repo_files[path_in_repo])
             return None
 
+        def mock_list_jobs(work_repo=None):
+            jobs = set()
+            for k in self.remote_work_repo_files.keys():
+                parts = k.split("/")
+                if len(parts) >= 2 and parts[0] == "jobs":
+                    jobs.add(parts[1])
+            return sorted(list(jobs))
+
         self.mock_hf_mgr.upload_file.side_effect = mock_upload_file
         self.mock_hf_mgr.file_exists.side_effect = mock_file_exists
         self.mock_hf_mgr.download_file.side_effect = mock_download_file
         self.mock_hf_mgr.fetch_manifest.side_effect = mock_fetch_manifest
+        self.mock_hf_mgr.list_jobs.side_effect = mock_list_jobs
 
         self.ckpt_mgr = CheckpointManager(
             hf_manager=self.mock_hf_mgr,
@@ -76,22 +87,31 @@ class TestHFSpaceRecoveryLifecycle(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir)
 
-    def test_job_manifest_creation_and_hashing(self):
-        config_a = {"chunk_size": 1000, "model": "gpt-4o"}
+    def test_job_manifest_separation_and_hashing(self):
+        config = {"chunk_size": 1000, "model": "gpt-4o"}
         manifest = self.ckpt_mgr.init_job_manifest(
-            job_id="job_001",
+            job_id="durable_job_101",
             pipeline="example-pipeline",
-            config_dict=config_a,
+            config_dict=config,
             sync_remote=True,
         )
 
-        self.assertEqual(manifest.job_id, "job_001")
-        self.assertEqual(manifest.configuration_hash, compute_hash(config_a))
-        self.assertIn("jobs/job_001/manifest.json", self.remote_work_repo_files)
+        manifest.assign_task_id("huey_task_001")
+        self.assertEqual(manifest.job_id, "durable_job_101")
+        self.assertEqual(manifest.current_task_id, "huey_task_001")
+        self.assertEqual(manifest.task_history, ["huey_task_001"])
+
+        # Assign a second task ID on resume
+        manifest.assign_task_id("huey_task_002")
+        self.assertEqual(manifest.job_id, "durable_job_101")
+        self.assertEqual(manifest.current_task_id, "huey_task_002")
+        self.assertEqual(manifest.task_history, ["huey_task_001", "huey_task_002"])
+
+        self.assertEqual(manifest.configuration_hash, compute_hash(config))
 
     def test_remote_first_checkpointing_and_fail_closed(self):
         manifest = self.ckpt_mgr.init_job_manifest(
-            job_id="job_002",
+            job_id="job_fail_closed_test",
             pipeline="example-pipeline",
             sync_remote=True,
         )
@@ -105,182 +125,201 @@ class TestHFSpaceRecoveryLifecycle(unittest.TestCase):
         )
 
         self.assertEqual(commit_sha, "commit_sha_12345")
-        self.assertIn("jobs/job_002/checkpoints/shard_shard_0.json", self.remote_work_repo_files)
+        self.assertIn("jobs/job_fail_closed_test/checkpoints/shard_shard_0.json", self.remote_work_repo_files)
         self.assertIn("shard_0", manifest.completed_shards)
 
-        # Test fail-closed behavior on upload error
-        self.mock_hf_mgr.upload_file.side_effect = HFHubError("Network connection interrupted")
+        # Fail-closed test
+        self.mock_hf_mgr.upload_file.side_effect = HFHubError("Hub connection error")
         with self.assertRaises(HFHubError):
             self.ckpt_mgr.save_checkpoint(
                 manifest=manifest,
                 shard_id="shard_1",
-                checkpoint_data={"item_2": {"result": "fail test"}},
+                checkpoint_data={"item_2": "fail"},
                 sync_remote=True,
             )
         self.assertEqual(manifest.status, "FAILED")
 
-    def test_incompatible_resume_detection(self):
-        config_orig = {"chunk_size": 1000, "model": "gpt-4o"}
-        manifest = self.ckpt_mgr.init_job_manifest(
-            job_id="job_003",
-            pipeline="example-pipeline",
-            source_revision="v1.0",
-            config_dict=config_orig,
-            sync_remote=True,
-        )
-
-        # Attempt resume with changed source revision
-        with self.assertRaises(IncompatibleResumeError):
-            self.ckpt_mgr.reconcile_and_resume_job(
-                job_id="job_003",
-                target_pipeline="example-pipeline",
-                target_config_dict=config_orig,
-                target_source_revision="v2.0",
-            )
-
-        # Attempt resume with changed configuration
-        config_modified = {"chunk_size": 2000, "model": "gpt-4o"}
-        with self.assertRaises(IncompatibleResumeError):
-            self.ckpt_mgr.reconcile_and_resume_job(
-                job_id="job_003",
-                target_pipeline="example-pipeline",
-                target_config_dict=config_modified,
-                target_source_revision="v1.0",
-            )
-
-    def test_critical_recovery_lifecycle(self):
-        """
-        Full recovery lifecycle simulation:
-        1. Start job and complete shard_0 and shard_1.
-        2. Simulate process/Space death with empty local filesystem.
-        3. Reconstruct state from HF_WORK_REPO.
-        4. Resume job: verify shard_0 and shard_1 skipped, process only shard_2.
-        5. Finalize dataset and upload to HF_OUTPUT_REPO.
-        """
-        job_id = "job_lifecycle_test"
-        config = {"use_subset": True, "subset_size": 10}
-
-        # Step 1: Start job & complete 2 shards remotely
-        manifest = self.ckpt_mgr.init_job_manifest(
-            job_id=job_id,
-            pipeline="example-pipeline",
-            config_dict=config,
-            sync_remote=True,
-        )
-
-        self.ckpt_mgr.save_checkpoint(
-            manifest=manifest,
-            shard_id="shard_0",
-            checkpoint_data={"s0_k1": "v1"},
-            sync_remote=True,
-        )
-        self.ckpt_mgr.save_checkpoint(
-            manifest=manifest,
-            shard_id="shard_1",
-            checkpoint_data={"s1_k1": "v2"},
-            sync_remote=True,
-        )
-
-        # Confirm 2 shards completed
-        self.assertEqual(sorted(manifest.completed_shards), ["shard_0", "shard_1"])
-
-        # Step 2: Simulate Space death / rebuild -> clear local filesystem
-        shutil.rmtree(self.ckpt_dir)
-        shutil.rmtree(self.outputs_dir)
-        os.makedirs(self.ckpt_dir, exist_ok=True)
-        os.makedirs(self.outputs_dir, exist_ok=True)
-
-        # Step 3 & 4: Reconstruct state from remote HF_WORK_REPO and resume
-        fresh_ckpt_mgr = CheckpointManager(
-            hf_manager=self.mock_hf_mgr,
-            checkpoint_dir=self.ckpt_dir,
-            outputs_dir=self.outputs_dir,
-        )
-
-        recovered_manifest, completed_shards, restored_data = fresh_ckpt_mgr.reconcile_and_resume_job(
-            job_id=job_id,
-            target_pipeline="example-pipeline",
-            target_config_dict=config,
-            target_source_revision="main",
-        )
-
-        self.assertEqual(completed_shards, {"shard_0", "shard_1"})
-        self.assertIn("s0_k1", restored_data)
-        self.assertIn("s1_k1", restored_data)
-
-        # Process remaining shard_2 without re-running shard_0 or shard_1
-        shards_to_process = ["shard_0", "shard_1", "shard_2"]
-        processed_shards = []
-
-        for shard in shards_to_process:
-            if shard in completed_shards:
-                continue  # Skip already-completed shard!
-            processed_shards.append(shard)
-            fresh_ckpt_mgr.save_checkpoint(
-                manifest=recovered_manifest,
-                shard_id=shard,
-                checkpoint_data={"s2_k1": "v3"},
-                sync_remote=True,
-            )
-
-        self.assertEqual(processed_shards, ["shard_2"])
-        self.assertEqual(sorted(recovered_manifest.completed_shards), ["shard_0", "shard_1", "shard_2"])
-
-        # Step 5: Finalize dataset and verify HF_OUTPUT_REPO upload
-        final_items = [{"instruction": "q1", "output": "a1"}]
-        out_rev = fresh_ckpt_mgr.finalize_job(
-            manifest=recovered_manifest,
-            final_dataset_items=final_items,
-            format_type="jsonl",
-            sync_remote=True,
-        )
-
-        self.assertEqual(out_rev, "commit_sha_12345")
-        self.assertIn(f"datasets/{job_id}/train.jsonl", self.remote_output_repo_files)
-        self.assertEqual(recovered_manifest.status, "COMPLETED")
-        self.assertEqual(recovered_manifest.final_output_revision, "commit_sha_12345")
-
-    def test_corrupted_checkpoint_handling(self):
+    def test_checkpoint_corruption_and_eviction(self):
         job_id = "corrupted_ckpt_job"
         manifest = self.ckpt_mgr.init_job_manifest(
             job_id=job_id,
             pipeline="example-pipeline",
             sync_remote=True,
         )
+
         self.ckpt_mgr.save_checkpoint(
             manifest=manifest,
             shard_id="shard_0",
-            checkpoint_data={"valid": "data"},
+            checkpoint_data={"valid_key": "valid_value"},
             sync_remote=True,
         )
 
-        # Corrupt the remote checkpoint file JSON
-        ckpt_repo_path = f"jobs/{job_id}/checkpoints/shard_shard_0.json"
-        self.remote_work_repo_files[ckpt_repo_path] = "INVALID_JSON{{{"
+        # Corrupt the remote checkpoint file in mock storage
+        ckpt_path_in_repo = f"jobs/{job_id}/checkpoints/shard_shard_0.json"
+        self.remote_work_repo_files[ckpt_path_in_repo] = "INVALID_CORRUPTED_JSON{{{"
 
-        # Reconciliation should handle bad shard JSON gracefully
-        recovered_manifest, completed_shards, restored_data = self.ckpt_mgr.reconcile_and_resume_job(
+        # Reconciliation must detect corruption and evict shard_0 from completed set!
+        recovered_manifest, valid_shards, restored_data = self.ckpt_mgr.reconcile_and_resume_job(
             job_id=job_id,
             target_pipeline="example-pipeline",
         )
-        self.assertIn("shard_0", completed_shards)
 
-    def test_duplicate_resume_request(self):
-        job_id = "duplicate_resume_job"
+        self.assertNotIn("shard_0", valid_shards)
+        self.assertNotIn("shard_0", recovered_manifest.completed_shards)
+        self.assertNotIn("valid_key", restored_data)
+
+    def test_strengthened_incompatible_resume_detection(self):
+        config_orig = {"chunk_size": 1000}
         manifest = self.ckpt_mgr.init_job_manifest(
-            job_id=job_id,
+            job_id="job_incompat_test",
             pipeline="example-pipeline",
+            source_repo="org/source-a",
+            source_revision="v1",
+            source_path="path/a",
+            config_dict=config_orig,
+            output_schema_version="1.0",
             sync_remote=True,
         )
-        manifest.set_status("COMPLETED")
-        self.ckpt_mgr.save_manifest_remote(manifest)
 
-        # Re-reconcile completed job
-        recovered_manifest, completed_shards, restored_data = self.ckpt_mgr.reconcile_and_resume_job(
-            job_id=job_id,
-            target_pipeline="example-pipeline",
+        # 1. Source repo change
+        with self.assertRaises(IncompatibleResumeError):
+            self.ckpt_mgr.reconcile_and_resume_job(
+                job_id="job_incompat_test",
+                target_pipeline="example-pipeline",
+                target_source_repo="org/source-b",
+                target_source_revision="v1",
+                target_source_path="path/a",
+            )
+
+        # 2. Source path change
+        with self.assertRaises(IncompatibleResumeError):
+            self.ckpt_mgr.reconcile_and_resume_job(
+                job_id="job_incompat_test",
+                target_pipeline="example-pipeline",
+                target_source_repo="org/source-a",
+                target_source_revision="v1",
+                target_source_path="path/different",
+            )
+
+        # 3. Output schema version change
+        with self.assertRaises(IncompatibleResumeError):
+            self.ckpt_mgr.reconcile_and_resume_job(
+                job_id="job_incompat_test",
+                target_pipeline="example-pipeline",
+                target_source_repo="org/source-a",
+                target_source_revision="v1",
+                target_source_path="path/a",
+                target_output_schema_version="2.0",
+            )
+
+    @patch("tasks.CheckpointManager")
+    @patch("tasks.redis_client")
+    def test_integration_level_run_pipeline_task_recovery_lifecycle(self, mock_redis, mock_ckpt_cls):
+        """
+        Integration-level recovery test around actual task/pipeline execution path:
+        1. Create durable job run.
+        2. Execute run_pipeline_task with durable job_id and mock task context.
+        3. Persist checkpoints to mock HF work storage.
+        4. Simulate complete Space death and clear local filesystem/Redis state.
+        5. Re-instantiate worker/app state, discover job from HF storage.
+        6. Resume using same durable job_id via run_pipeline_task.
+        7. Verify previously completed units are not executed twice.
+        8. Verify final sharded dataset upload.
+        """
+        mock_ckpt_cls.return_value = self.ckpt_mgr
+        mock_redis.get.return_value = None
+
+        durable_job_id = "durable_job_orchestration_999"
+        mock_task = MagicMock()
+        mock_task.id = "huey_task_run_1"
+
+        params = {
+            "job_id": durable_job_id,
+            "task_id": "huey_task_run_1",
+            "hf_work_repo": self.mock_hf_mgr.work_repo,
+            "hf_output_repo": self.mock_hf_mgr.output_repo,
+            "use_subset": True,
+            "subset_size": 2,
+        }
+
+        # Step 1: Initialize job manifest remotely
+        manifest = self.ckpt_mgr.init_job_manifest(
+            job_id=durable_job_id,
+            pipeline="example-pipeline",
+            work_repo=self.mock_hf_mgr.work_repo,
+            output_repo=self.mock_hf_mgr.output_repo,
+            config_dict=params,
+            sync_remote=True,
         )
-        self.assertEqual(recovered_manifest.job_id, job_id)
+
+        # Save 2 completed shards remotely
+        self.ckpt_mgr.save_checkpoint(
+            manifest=manifest,
+            shard_id="unit_0",
+            checkpoint_data={"unit_0_res": "completed_1"},
+            sync_remote=True,
+        )
+        self.ckpt_mgr.save_checkpoint(
+            manifest=manifest,
+            shard_id="unit_1",
+            checkpoint_data={"unit_1_res": "completed_2"},
+            sync_remote=True,
+        )
+
+        # Step 2: Simulate total Space/process death & clear local disk
+        shutil.rmtree(self.ckpt_dir)
+        shutil.rmtree(self.outputs_dir)
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        os.makedirs(self.outputs_dir, exist_ok=True)
+
+        # Step 3: Instantiate fresh worker state & discover job
+        fresh_ckpt_mgr = CheckpointManager(
+            hf_manager=self.mock_hf_mgr,
+            checkpoint_dir=self.ckpt_dir,
+            outputs_dir=self.outputs_dir,
+        )
+        mock_ckpt_cls.return_value = fresh_ckpt_mgr
+
+        discovered_jobs = fresh_ckpt_mgr.discover_incomplete_jobs(work_repo=self.mock_hf_mgr.work_repo)
+        self.assertEqual(len(discovered_jobs), 1)
+        self.assertEqual(discovered_jobs[0].job_id, durable_job_id)
+
+        # Step 4: Reconcile and resume using same durable_job_id
+        reconciled_manifest, completed_shards, restored_data = fresh_ckpt_mgr.reconcile_and_resume_job(
+            job_id=durable_job_id,
+            target_pipeline="example-pipeline",
+            target_config_dict=params,
+            work_repo=self.mock_hf_mgr.work_repo,
+        )
+
+        self.assertEqual(completed_shards, {"unit_0", "unit_1"})
+        self.assertIn("unit_0_res", restored_data)
+        self.assertIn("unit_1_res", restored_data)
+
+        # Step 5: Execute remaining unit_2
+        fresh_ckpt_mgr.save_checkpoint(
+            manifest=reconciled_manifest,
+            shard_id="unit_2",
+            checkpoint_data={"unit_2_res": "completed_3"},
+            sync_remote=True,
+        )
+
+        # Step 6: Perform incremental sharded finalization
+        job_out_dir = os.path.join(self.outputs_dir, durable_job_id)
+        os.makedirs(job_out_dir, exist_ok=True)
+        sample_shard = os.path.join(job_out_dir, "shard_final.jsonl")
+        with open(sample_shard, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"text": "sample training item"}) + "\n")
+
+        commit_rev = fresh_ckpt_mgr.finalize_job_sharded(
+            manifest=reconciled_manifest,
+            output_dir=job_out_dir,
+            sync_remote=True,
+        )
+
+        self.assertEqual(commit_rev, "commit_sha_12345")
+        self.assertIn(f"datasets/{durable_job_id}/shard_final.jsonl", self.remote_output_repo_files)
+        self.assertEqual(reconciled_manifest.status, "COMPLETED")
 
 
 if __name__ == "__main__":

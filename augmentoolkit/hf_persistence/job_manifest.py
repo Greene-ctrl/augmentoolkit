@@ -17,9 +17,17 @@ def compute_hash(data: Any) -> str:
         return hashlib.sha256(data).hexdigest()
     if isinstance(data, str):
         return hashlib.sha256(data.encode("utf-8")).hexdigest()
-    # Serialize dict/list with sorted keys for deterministic hashing
     canonical_json = json.dumps(data, sort_keys=True, default=str)
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
+def compute_file_hash(filepath: str) -> str:
+    """Computes SHA256 hash of a file."""
+    sha256 = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        while chunk := f.read(65536):
+            sha256.update(chunk)
+    return sha256.hexdigest()
 
 
 def compute_dir_hash(dir_path: str) -> str:
@@ -32,10 +40,9 @@ def compute_dir_hash(dir_path: str) -> str:
         for fname in sorted(files):
             fpath = os.path.join(root, fname)
             try:
-                with open(fpath, "rb") as f:
-                    file_hash = hashlib.sha256(f.read()).hexdigest()
-                    rel_path = os.path.relpath(fpath, dir_path)
-                    hashes.append(f"{rel_path}:{file_hash}")
+                rel_path = os.path.relpath(fpath, dir_path)
+                file_h = compute_file_hash(fpath)
+                hashes.append(f"{rel_path}:{file_h}")
             except Exception:
                 pass
     return compute_hash(hashes)
@@ -60,7 +67,10 @@ def get_code_revision() -> str:
 
 
 class JobManifest:
-    """Encapsulates the state and metadata of a dataset generation job."""
+    """
+    Encapsulates the state and metadata of a durable dataset generation job.
+    Maintains strict separation between durable job_id and ephemeral task_id (Huey execution).
+    """
 
     def __init__(
         self,
@@ -75,15 +85,20 @@ class JobManifest:
         configuration_hash: str = "",
         prompt_config_hash: str = "",
         code_revision: Optional[str] = None,
+        output_schema_version: str = "1.0",
         current_stage: str = "initialized",
         current_shard: Optional[Union[str, int]] = None,
         completed_shards: Optional[List[Union[str, int]]] = None,
+        checkpoints_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+        output_shards: Optional[List[Dict[str, Any]]] = None,
         status: str = "PENDING",
+        current_task_id: Optional[str] = None,
+        task_history: Optional[List[str]] = None,
         timestamps: Optional[Dict[str, Any]] = None,
         error_retry_info: Optional[Dict[str, Any]] = None,
         final_output_revision: Optional[str] = None,
     ):
-        self.job_id = job_id
+        self.job_id = job_id  # Durable identifier across restarts/resumes
         self.pipeline = pipeline
         self.source_repo = source_repo
         self.source_revision = source_revision
@@ -94,10 +109,20 @@ class JobManifest:
         self.configuration_hash = configuration_hash
         self.prompt_config_hash = prompt_config_hash
         self.code_revision = code_revision or get_code_revision()
+        self.output_schema_version = output_schema_version
+
         self.current_stage = current_stage
         self.current_shard = current_shard
         self.completed_shards = completed_shards or []
+        self.checkpoints_metadata = checkpoints_metadata or {}
+        self.output_shards = output_shards or []
+
         self.status = status
+        self.current_task_id = current_task_id  # Ephemeral Huey task ID
+        self.task_history = task_history or []
+        if current_task_id and current_task_id not in self.task_history:
+            self.task_history.append(current_task_id)
+
         now = time.time()
         self.timestamps = timestamps or {
             "created_at": now,
@@ -111,12 +136,54 @@ class JobManifest:
         }
         self.final_output_revision = final_output_revision
 
+    def assign_task_id(self, task_id: str):
+        """Associates a new ephemeral execution task_id with this durable job."""
+        self.current_task_id = task_id
+        if task_id not in self.task_history:
+            self.task_history.append(task_id)
+        self.update_timestamp()
+
     def update_timestamp(self):
         self.timestamps["updated_at"] = time.time()
 
-    def mark_shard_completed(self, shard_id: Union[str, int]):
-        if shard_id not in self.completed_shards:
+    def mark_shard_completed(
+        self,
+        shard_id: Union[str, int],
+        checksum: Optional[str] = None,
+        size: Optional[int] = None,
+        record_count: Optional[int] = None,
+    ):
+        shard_str = str(shard_id)
+        if shard_str not in [str(s) for s in self.completed_shards]:
             self.completed_shards.append(shard_id)
+
+        self.checkpoints_metadata[shard_str] = {
+            "checksum": checksum,
+            "size": size,
+            "record_count": record_count,
+            "updated_at": time.time(),
+        }
+        self.update_timestamp()
+
+    def record_output_shard(
+        self,
+        filename: str,
+        record_count: int,
+        sha256: str,
+        commit_sha: str,
+        path_in_repo: str,
+    ):
+        shard_record = {
+            "filename": filename,
+            "record_count": record_count,
+            "sha256": sha256,
+            "commit_sha": commit_sha,
+            "path_in_repo": path_in_repo,
+            "uploaded_at": time.time(),
+        }
+        # Deduplicate by filename
+        self.output_shards = [s for s in self.output_shards if s["filename"] != filename]
+        self.output_shards.append(shard_record)
         self.update_timestamp()
 
     def set_status(self, new_status: str, error_msg: Optional[str] = None):
@@ -133,6 +200,8 @@ class JobManifest:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "job_id": self.job_id,
+            "current_task_id": self.current_task_id,
+            "task_history": list(self.task_history),
             "pipeline": self.pipeline,
             "source_repo": self.source_repo,
             "source_revision": self.source_revision,
@@ -143,9 +212,12 @@ class JobManifest:
             "configuration_hash": self.configuration_hash,
             "prompt_config_hash": self.prompt_config_hash,
             "code_revision": self.code_revision,
+            "output_schema_version": self.output_schema_version,
             "current_stage": self.current_stage,
             "current_shard": self.current_shard,
             "completed_shards": list(self.completed_shards),
+            "checkpoints_metadata": dict(self.checkpoints_metadata),
+            "output_shards": list(self.output_shards),
             "status": self.status,
             "timestamps": dict(self.timestamps),
             "error_retry_info": dict(self.error_retry_info),
@@ -156,6 +228,8 @@ class JobManifest:
     def from_dict(cls, data: Dict[str, Any]) -> "JobManifest":
         return cls(
             job_id=data["job_id"],
+            current_task_id=data.get("current_task_id"),
+            task_history=data.get("task_history", []),
             pipeline=data.get("pipeline", "unknown"),
             source_repo=data.get("source_repo", ""),
             source_revision=data.get("source_revision", "main"),
@@ -166,9 +240,12 @@ class JobManifest:
             configuration_hash=data.get("configuration_hash", ""),
             prompt_config_hash=data.get("prompt_config_hash", ""),
             code_revision=data.get("code_revision"),
+            output_schema_version=data.get("output_schema_version", "1.0"),
             current_stage=data.get("current_stage", "initialized"),
             current_shard=data.get("current_shard"),
             completed_shards=data.get("completed_shards", []),
+            checkpoints_metadata=data.get("checkpoints_metadata", {}),
+            output_shards=data.get("output_shards", []),
             status=data.get("status", "PENDING"),
             timestamps=data.get("timestamps"),
             error_retry_info=data.get("error_retry_info"),
@@ -187,32 +264,37 @@ class JobManifestManager:
     ) -> Tuple[bool, List[str]]:
         """
         Refuses automatic continuation when materially relevant inputs changed:
-        - source_revision
-        - configuration_hash
-        - prompt_config_hash
-        - code_revision (if strict_code_rev is True or major difference)
+        - source_repo / source_revision / source_path / source_split
+        - merged generation config hash
+        - generation prompt hash
+        - output schema version
+        - relevant code revision (if strict_code_rev is True)
         """
         mismatches = []
 
+        if existing_manifest.source_repo != target_manifest.source_repo:
+            mismatches.append(f"source_repo changed: {existing_manifest.source_repo} -> {target_manifest.source_repo}")
+
         if existing_manifest.source_revision != target_manifest.source_revision:
-            mismatches.append(
-                f"source_revision changed: {existing_manifest.source_revision} -> {target_manifest.source_revision}"
-            )
+            mismatches.append(f"source_revision changed: {existing_manifest.source_revision} -> {target_manifest.source_revision}")
+
+        if existing_manifest.source_path != target_manifest.source_path:
+            mismatches.append(f"source_path changed: {existing_manifest.source_path} -> {target_manifest.source_path}")
+
+        if existing_manifest.source_split != target_manifest.source_split:
+            mismatches.append(f"source_split changed: {existing_manifest.source_split} -> {target_manifest.source_split}")
 
         if existing_manifest.configuration_hash != target_manifest.configuration_hash:
-            mismatches.append(
-                f"configuration_hash changed: {existing_manifest.configuration_hash} -> {target_manifest.configuration_hash}"
-            )
+            mismatches.append(f"configuration_hash changed: {existing_manifest.configuration_hash} -> {target_manifest.configuration_hash}")
 
         if existing_manifest.prompt_config_hash != target_manifest.prompt_config_hash:
-            mismatches.append(
-                f"prompt_config_hash changed: {existing_manifest.prompt_config_hash} -> {target_manifest.prompt_config_hash}"
-            )
+            mismatches.append(f"prompt_config_hash changed: {existing_manifest.prompt_config_hash} -> {target_manifest.prompt_config_hash}")
+
+        if existing_manifest.output_schema_version != target_manifest.output_schema_version:
+            mismatches.append(f"output_schema_version changed: {existing_manifest.output_schema_version} -> {target_manifest.output_schema_version}")
 
         if strict_code_rev and (existing_manifest.code_revision != target_manifest.code_revision):
-            mismatches.append(
-                f"code_revision changed: {existing_manifest.code_revision} -> {target_manifest.code_revision}"
-            )
+            mismatches.append(f"code_revision changed: {existing_manifest.code_revision} -> {target_manifest.code_revision}")
 
         is_compatible = len(mismatches) == 0
         return is_compatible, mismatches
