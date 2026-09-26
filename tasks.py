@@ -7,6 +7,7 @@ import logging
 import subprocess
 import json
 import signal
+import threading
 from typing import Optional, Dict, Any, TYPE_CHECKING, IO, Union
 import traceback
 import io
@@ -41,6 +42,14 @@ OUTPUT_DIR_MAPPING_TIMEOUT = PID_KEY_TIMEOUT * 7
 PARAMETERS_TIMEOUT = OUTPUT_DIR_MAPPING_TIMEOUT
 FINAL_STATUS_TIMEOUT = OUTPUT_DIR_MAPPING_TIMEOUT
 JOB_LOCK_TIMEOUT = 12 * 60 * 60  # 12 hours
+
+LUA_RELEASE_LOCK = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+"""
 
 
 def find_first_output_dir(
@@ -83,6 +92,55 @@ def set_final_status(
         print(f"Task {task_id}: Failed to set final status '{status}' in Redis ({redis_key}): {e}")
 
 
+def release_owned_job_lock(job_id: str, task_id: str) -> bool:
+    """Releases Redis lock for durable job_id ONLY if lock value matches current task_id."""
+    lock_key = f"durable_job_lock:{job_id}"
+    try:
+        res = redis_client.eval(LUA_RELEASE_LOCK, 1, lock_key, task_id)
+        return bool(res)
+    except Exception as e:
+        logger.warning(f"Error releasing lock for job {job_id}: {e}")
+        return False
+
+
+class JobLockHeartbeat:
+    """Periodically renews Redis lease for long-running jobs if lock is still owned by task_id."""
+
+    def __init__(self, job_id: str, task_id: str, lease_seconds: int = JOB_LOCK_TIMEOUT, interval_seconds: int = 60):
+        self.job_id = job_id
+        self.task_id = task_id
+        self.lock_key = f"durable_job_lock:{job_id}"
+        self.lease_ms = lease_seconds * 1000
+        self.interval_seconds = interval_seconds
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._run_heartbeat, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def _run_heartbeat(self):
+        while self._running:
+            time.sleep(self.interval_seconds)
+            if not self._running:
+                break
+            try:
+                curr_owner = redis_client.get(self.lock_key)
+                if curr_owner and curr_owner.decode("utf-8") == self.task_id:
+                    redis_client.pexpire(self.lock_key, self.lease_ms)
+                else:
+                    logger.warning(f"Heartbeat lost lock ownership for job {self.job_id}")
+                    break
+            except Exception as e:
+                logger.warning(f"Heartbeat error for job {self.job_id}: {e}")
+
+
 @huey.task(context=True)
 def run_pipeline_task(
     task: "Task",
@@ -92,32 +150,34 @@ def run_pipeline_task(
 ):
     """
     Executes a pipeline via a subprocess with explicit subprocess environment context,
-    managing separate durable job_id and ephemeral Huey task_id, fail-closed remote persistence,
-    and incremental sharded dataset uploading.
+    managing separate durable job_id and ephemeral Huey task_id with atomic Redis lock ownership,
+    fail-closed remote persistence, and incremental sharded dataset uploading.
     """
     task_id = str(task.id)
     if parameters is None:
         parameters = {}
 
-    # Separate durable job_id from ephemeral Huey task_id
     durable_job_id = str(parameters.get("job_id") or parameters.get("task_id") or task_id)
 
     redis_pid_key = f"worker_pid_for_task:{task_id}"
     redis_output_dir_key = f"output_dir_for_task:{task_id}"
     redis_params_key = f"parameters_for_task:{task_id}"
     redis_status_key = f"status_for_task:{task_id}"
-    job_lock_key = f"active_lock_for_job:{durable_job_id}"
+    job_lock_key = f"durable_job_lock:{durable_job_id}"
 
-    # Lock to prevent duplicate concurrent runs for the same durable job_id
-    current_lock = redis_client.get(job_lock_key)
-    if current_lock and current_lock.decode("utf-8") != task_id:
-        active_task = current_lock.decode("utf-8")
-        msg = f"Job '{durable_job_id}' is already actively executing under Huey task ID '{active_task}'. Duplicate execution rejected."
-        logger.error(msg)
-        set_final_status(task_id, "FAILED", msg, details={"error": "duplicate_job_execution"})
-        raise RuntimeError(msg)
+    # Atomic owned lock acquisition via SET NX PX
+    lock_acquired = redis_client.set(job_lock_key, task_id, nx=True, px=JOB_LOCK_TIMEOUT * 1000)
+    if not lock_acquired:
+        curr_owner = redis_client.get(job_lock_key)
+        owner_str = curr_owner.decode("utf-8") if curr_owner else "unknown"
+        if owner_str != task_id:
+            msg = f"Job '{durable_job_id}' is currently locked/executing under task ID '{owner_str}'. Duplicate execution rejected."
+            logger.error(msg)
+            set_final_status(task_id, "FAILED", msg, details={"error": "duplicate_job_execution"})
+            raise RuntimeError(msg)
 
-    redis_client.set(job_lock_key, task_id, ex=JOB_LOCK_TIMEOUT)
+    heartbeat = JobLockHeartbeat(durable_job_id, task_id, lease_seconds=JOB_LOCK_TIMEOUT)
+    heartbeat.start()
 
     process = None
     log_file: Optional[io.TextIOWrapper] = None
@@ -135,7 +195,8 @@ def run_pipeline_task(
     try:
         parameters_flat = flatten_config(parameters, no_flatten_keys=no_flatten_keys)
     except Exception as fc_e:
-        redis_client.delete(job_lock_key)
+        heartbeat.stop()
+        release_owned_job_lock(durable_job_id, task_id)
         set_final_status(
             task_id,
             "FAILED",
@@ -170,7 +231,8 @@ def run_pipeline_task(
             )
             print(f"Job {durable_job_id}: Source download complete.")
         except Exception as src_e:
-            redis_client.delete(job_lock_key)
+            heartbeat.stop()
+            release_owned_job_lock(durable_job_id, task_id)
             msg = f"Failed to download source input from HF Hub for job {durable_job_id}: {src_e}"
             logger.error(msg)
             set_final_status(task_id, "FAILED", msg, details={"error": str(src_e)})
@@ -201,18 +263,17 @@ def run_pipeline_task(
                 manifest.assign_task_id(task_id)
                 manifest.set_status("RUNNING")
 
-            # Persist and verify manifest upload strictly before proceeding
             ckpt_mgr.save_manifest_remote(manifest)
             print(f"Job {durable_job_id}: Manifest initialized/updated and verified on {hf_work_repo}")
         except Exception as manifest_e:
-            redis_client.delete(job_lock_key)
+            heartbeat.stop()
+            release_owned_job_lock(durable_job_id, task_id)
             msg = f"Fail-closed: Manifest creation or remote sync failed for job {durable_job_id} on repo {hf_work_repo}: {manifest_e}"
             logger.error(msg)
             set_final_status(task_id, "FAILED", msg, details={"error": str(manifest_e)})
             raise HFHubError(msg) from manifest_e
 
     try:
-        # Determine output directory
         output_dir_value = None
         resolved_output_dir = None
 
@@ -313,10 +374,7 @@ def run_pipeline_task(
             ckpt_mgr.sync_log_file(manifest, log_file_path)
 
         if exit_code == 0:
-            set_final_status(task_id, "COMPLETED", f"Pipeline job {durable_job_id} (task {task_id}) completed successfully.")
-            final_status_set = True
-
-            # Incremental sharded dataset upload to HF_OUTPUT_REPO (NO whole dataset in RAM!)
+            # Incremental sharded dataset upload to HF_OUTPUT_REPO before setting COMPLETED
             if manifest and resolved_output_dir and os.path.exists(resolved_output_dir):
                 out_rev = ckpt_mgr.finalize_job_sharded(
                     manifest=manifest,
@@ -325,6 +383,10 @@ def run_pipeline_task(
                     log_file_path=log_file_path,
                 )
                 print(f"Job {durable_job_id}: Incremental sharded finalization uploaded to {manifest.output_repo} (Revision: {out_rev})")
+
+            # Set COMPLETED status in Redis ONLY AFTER HF output finalization and manifest upload succeed!
+            set_final_status(task_id, "COMPLETED", f"Pipeline job {durable_job_id} (task {task_id}) completed successfully.")
+            final_status_set = True
 
             return {
                 "status": "success",
@@ -385,7 +447,9 @@ def run_pipeline_task(
         raise
 
     finally:
-        redis_client.delete(job_lock_key)
+        heartbeat.stop()
+        release_owned_job_lock(durable_job_id, task_id)
+
         if log_file:
             try:
                 log_file.close()

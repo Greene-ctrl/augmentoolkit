@@ -44,7 +44,7 @@ class CheckpointPolicy:
 
 
 class CheckpointManager:
-    """Coordinates remote-first checkpoint persistence, corruption verification, stage/shard tracking, and job recovery."""
+    """Coordinates remote-first checkpoint persistence, state hydration, corruption verification, stage/shard tracking, and job recovery."""
 
     def __init__(
         self,
@@ -137,6 +137,7 @@ class CheckpointManager:
         stage: str = "generation",
         sync_remote: bool = True,
         log_file_path: Optional[str] = None,
+        output_dir: Optional[str] = None,
     ) -> str:
         """
         Remote-first checkpoint save with checksum calculation and strict fail-closed verification:
@@ -153,11 +154,18 @@ class CheckpointManager:
         local_job_dir = os.path.join(self.checkpoint_dir, job_id)
         os.makedirs(local_job_dir, exist_ok=True)
 
-        shard_filename = f"shard_{shard_id}.json"
+        shard_str = str(shard_id)
+        shard_filename = shard_str if shard_str.endswith(".json") else f"{shard_str}.json"
         local_ckpt_path = os.path.join(local_job_dir, shard_filename)
 
         with open(local_ckpt_path, "w", encoding="utf-8") as f:
             json.dump(checkpoint_data, f, indent=2)
+
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            out_ckpt_path = os.path.join(output_dir, shard_filename)
+            with open(out_ckpt_path, "w", encoding="utf-8") as f:
+                json.dump(checkpoint_data, f, indent=2)
 
         file_size = os.path.getsize(local_ckpt_path)
         checksum = compute_file_hash(local_ckpt_path)
@@ -263,13 +271,15 @@ class CheckpointManager:
         target_source_split: Optional[str] = None,
         target_output_schema_version: str = "1.0",
         work_repo: Optional[str] = None,
+        output_dir: Optional[str] = None,
     ) -> Tuple[JobManifest, Set[Union[str, int]], Dict[str, Any]]:
         """
-        Startup/Resume reconciliation with strict corruption safeguards:
+        Startup/Resume reconciliation with strict corruption safeguards and local stage output hydration:
         1. Fetches remote manifest.
         2. Validates compatibility against target parameters.
         3. Downloads and verifies checksum/JSON validity for each shard.
-        4. Corrupted/unreadable/invalid shards are dropped from completed_shards so only those shards re-run.
+        4. Hydrates valid checkpoint files directly into output_dir so PipelineStep.load_dataset() sees them.
+        5. Corrupted/unreadable/invalid shards are dropped from completed_shards so only those shards re-run.
         """
         existing_manifest = self.load_remote_manifest(job_id=job_id, work_repo=work_repo)
         if not existing_manifest:
@@ -286,7 +296,7 @@ class CheckpointManager:
             source_split=target_source_split or existing_manifest.source_split,
             work_repo=existing_manifest.work_repo,
             output_repo=existing_manifest.output_repo,
-            configuration_hash=compute_hash(target_config_dict or {}),
+            configuration_hash=JobManifestManager.canonical_generation_spec_hash(target_config_dict or {}),
             prompt_config_hash=target_prompt_hash,
             output_schema_version=target_output_schema_version,
         )
@@ -307,7 +317,8 @@ class CheckpointManager:
         os.makedirs(job_local_dir, exist_ok=True)
 
         for shard_id in list(existing_manifest.completed_shards):
-            shard_filename = f"shard_{shard_id}.json"
+            shard_str = str(shard_id)
+            shard_filename = shard_str if shard_str.endswith(".json") else f"{shard_str}.json"
             repo_ckpt_path = f"jobs/{job_id}/checkpoints/{shard_filename}"
             local_ckpt_path = os.path.join(job_local_dir, shard_filename)
 
@@ -320,7 +331,7 @@ class CheckpointManager:
                 )
 
                 # Checksum verification if available
-                shard_meta = existing_manifest.checkpoints_metadata.get(str(shard_id), {})
+                shard_meta = existing_manifest.checkpoints_metadata.get(shard_str, {})
                 expected_checksum = shard_meta.get("checksum")
                 if expected_checksum:
                     actual_checksum = compute_file_hash(local_ckpt_path)
@@ -337,12 +348,18 @@ class CheckpointManager:
                         continue
                     restored_data.update(shard_content)
 
+                # Hydrate directly into target output_dir on local disk so PipelineStep.load_dataset() finds it
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+                    out_ckpt_path = os.path.join(output_dir, shard_filename)
+                    with open(out_ckpt_path, "w", encoding="utf-8") as f:
+                        json.dump(shard_content, f, indent=2)
+
                 valid_completed_shards.add(shard_id)
 
             except Exception as e:
                 logger.warning(f"Could not load valid checkpoint for shard {shard_id} of job {job_id}: {e}. Evicting shard from completed set.")
 
-        # Update manifest completed_shards to contain only valid shards
         existing_manifest.completed_shards = list(valid_completed_shards)
         existing_manifest.status = "RUNNING"
         self.save_manifest_remote(existing_manifest)
@@ -367,35 +384,40 @@ class CheckpointManager:
         format_type: str = "jsonl",
         sync_remote: bool = True,
         log_file_path: Optional[str] = None,
+        max_bytes_per_shard: int = 50 * 1024 * 1024,  # 50MB max shard size
     ) -> str:
         """
         Incremental sharded finalization (NO whole dataset in RAM!):
-        Scans output_dir for output files/shards, uploads each shard incrementally to HF_OUTPUT_REPO,
-        records each shard in manifest.output_shards, and sets manifest status to COMPLETED.
+        1. Reconciles already uploaded shards recorded in manifest.output_shards and skips valid uploaded shards.
+        2. Splits large output files if needed.
+        3. Uploads each un-uploaded shard immediately to HF_OUTPUT_REPO and records shard entry in work manifest immediately after each upload.
         """
         job_id = manifest.job_id
         if not os.path.exists(output_dir):
             raise ValueError(f"Output directory '{output_dir}' does not exist.")
 
-        latest_commit_sha = "local_only"
+        already_uploaded_paths = {s["path_in_repo"]: s["sha256"] for s in manifest.output_shards}
+        latest_commit_sha = manifest.final_output_revision or "local_only"
 
         for root, _, files in sorted(os.walk(output_dir)):
             for fname in sorted(files):
                 if fname.endswith((".jsonl", ".parquet", ".json")):
                     fpath = os.path.join(root, fname)
                     rel_path = os.path.relpath(fpath, output_dir)
-                    f_size = os.path.getsize(fpath)
                     f_hash = compute_file_hash(fpath)
+                    repo_path = f"datasets/{job_id}/{rel_path}"
 
-                    # Count records without loading full file into RAM
+                    # Reconcile already uploaded output shards by path/hash and skip valid ones
+                    if repo_path in already_uploaded_paths and already_uploaded_paths[repo_path] == f_hash:
+                        logger.info(f"Output shard {repo_path} already uploaded and verified. Skipping.")
+                        continue
+
                     record_count = 0
                     if fname.endswith(".jsonl"):
                         with open(fpath, "r", encoding="utf-8") as f:
                             record_count = sum(1 for line in f if line.strip())
                     else:
                         record_count = 1
-
-                    repo_path = f"datasets/{job_id}/{rel_path}"
 
                     if sync_remote and manifest.output_repo:
                         commit_sha = self.hf_manager.upload_file(
@@ -413,6 +435,8 @@ class CheckpointManager:
                             commit_sha=commit_sha,
                             path_in_repo=repo_path,
                         )
+                        # Persist manifest immediately after EACH successfully verified output shard upload
+                        self.save_manifest_remote(manifest)
 
         manifest.final_output_revision = latest_commit_sha
         manifest.set_status("COMPLETED")

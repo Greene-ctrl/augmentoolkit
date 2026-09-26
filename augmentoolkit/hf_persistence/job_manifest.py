@@ -181,7 +181,6 @@ class JobManifest:
             "path_in_repo": path_in_repo,
             "uploaded_at": time.time(),
         }
-        # Deduplicate by filename
         self.output_shards = [s for s in self.output_shards if s["filename"] != filename]
         self.output_shards.append(shard_record)
         self.update_timestamp()
@@ -256,45 +255,101 @@ class JobManifest:
 class JobManifestManager:
     """Utility class for validating compatibility and constructing manifests."""
 
+    EXCLUDED_RUNTIME_KEYS = {
+        "task_id",
+        "job_id",
+        "current_task_id",
+        "task_history",
+        "restored_shards",
+        "completed_shards",
+        "output_dir",
+        "input_dir",
+        "chunking_output_dir",
+        "no_flatten",
+        "hf_source_repo",
+        "hf_work_repo",
+        "hf_output_repo",
+        "timestamps",
+        "status",
+        "error_retry_info",
+    }
+
+    @classmethod
+    def canonical_generation_spec(cls, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Strips ephemeral runtime parameters to yield a canonical immutable generation specification."""
+        if not isinstance(config_dict, dict):
+            return {}
+        spec = {}
+        for k, v in config_dict.items():
+            if k in cls.EXCLUDED_RUNTIME_KEYS:
+                continue
+            if isinstance(v, dict):
+                spec[k] = cls.canonical_generation_spec(v)
+            else:
+                spec[k] = v
+        return spec
+
+    @classmethod
+    def canonical_generation_spec_hash(cls, config_dict: Dict[str, Any]) -> str:
+        """Computes deterministic SHA256 hash of canonical generation spec."""
+        spec = cls.canonical_generation_spec(config_dict)
+        return compute_hash(spec)
+
+    @classmethod
+    def compute_live_prompt_hash(
+        cls,
+        prompt_folder: Optional[str] = None,
+        default_prompt_folder: Optional[str] = None,
+    ) -> str:
+        """Computes SHA256 hash from live prompt files on disk."""
+        dir_hashes = []
+        for pdir in (prompt_folder, default_prompt_folder):
+            if pdir and os.path.exists(pdir):
+                dir_hashes.append(compute_dir_hash(pdir))
+        if not dir_hashes:
+            return compute_hash("DEFAULT_PROMPTS_SPEC")
+        return compute_hash(dir_hashes)
+
     @staticmethod
     def check_compatibility(
         existing_manifest: JobManifest,
         target_manifest: JobManifest,
-        strict_code_rev: bool = False,
+        strict_code_rev: bool = True,
     ) -> Tuple[bool, List[str]]:
         """
         Refuses automatic continuation when materially relevant inputs changed:
         - source_repo / source_revision / source_path / source_split
-        - merged generation config hash
+        - merged canonical generation config hash
         - generation prompt hash
         - output schema version
-        - relevant code revision (if strict_code_rev is True)
+        - code revision (by default)
         """
         mismatches = []
 
         if existing_manifest.source_repo != target_manifest.source_repo:
-            mismatches.append(f"source_repo changed: {existing_manifest.source_repo} -> {target_manifest.source_repo}")
+            mismatches.append(f"source_repo changed: '{existing_manifest.source_repo}' -> '{target_manifest.source_repo}'")
 
         if existing_manifest.source_revision != target_manifest.source_revision:
-            mismatches.append(f"source_revision changed: {existing_manifest.source_revision} -> {target_manifest.source_revision}")
+            mismatches.append(f"source_revision changed: '{existing_manifest.source_revision}' -> '{target_manifest.source_revision}'")
 
         if existing_manifest.source_path != target_manifest.source_path:
-            mismatches.append(f"source_path changed: {existing_manifest.source_path} -> {target_manifest.source_path}")
+            mismatches.append(f"source_path changed: '{existing_manifest.source_path}' -> '{target_manifest.source_path}'")
 
         if existing_manifest.source_split != target_manifest.source_split:
-            mismatches.append(f"source_split changed: {existing_manifest.source_split} -> {target_manifest.source_split}")
+            mismatches.append(f"source_split changed: '{existing_manifest.source_split}' -> '{target_manifest.source_split}'")
 
         if existing_manifest.configuration_hash != target_manifest.configuration_hash:
-            mismatches.append(f"configuration_hash changed: {existing_manifest.configuration_hash} -> {target_manifest.configuration_hash}")
+            mismatches.append(f"configuration_hash changed: '{existing_manifest.configuration_hash}' -> '{target_manifest.configuration_hash}'")
 
-        if existing_manifest.prompt_config_hash != target_manifest.prompt_config_hash:
-            mismatches.append(f"prompt_config_hash changed: {existing_manifest.prompt_config_hash} -> {target_manifest.prompt_config_hash}")
+        if existing_manifest.prompt_config_hash and target_manifest.prompt_config_hash:
+            if existing_manifest.prompt_config_hash != target_manifest.prompt_config_hash:
+                mismatches.append(f"prompt_config_hash changed: '{existing_manifest.prompt_config_hash}' -> '{target_manifest.prompt_config_hash}'")
 
         if existing_manifest.output_schema_version != target_manifest.output_schema_version:
-            mismatches.append(f"output_schema_version changed: {existing_manifest.output_schema_version} -> {target_manifest.output_schema_version}")
+            mismatches.append(f"output_schema_version changed: '{existing_manifest.output_schema_version}' -> '{target_manifest.output_schema_version}'")
 
         if strict_code_rev and (existing_manifest.code_revision != target_manifest.code_revision):
-            mismatches.append(f"code_revision changed: {existing_manifest.code_revision} -> {target_manifest.code_revision}")
+            mismatches.append(f"code_revision changed: '{existing_manifest.code_revision}' -> '{target_manifest.code_revision}'")
 
         is_compatible = len(mismatches) == 0
         return is_compatible, mismatches

@@ -36,17 +36,20 @@ Configure the following secrets/variables in your Hugging Face Space settings:
 
 ---
 
-## 3. Durable Job ID vs. Ephemeral Task ID
+## 3. Durable Job ID vs. Ephemeral Task ID & Atomic Concurrency Lock
 
 Generation jobs maintain a strict separation between identifiers:
 - **Durable `job_id`**: Identifies the dataset generation run across Space restarts, process terminations, and resume attempts.
 - **Ephemeral `task_id`**: Assigned by the Huey task queue for a specific execution attempt.
 
-When a job is resumed via `/jobs/{job_id}/resume` or auto-resume, the execution continues the existing manifest under the same durable `job_id`, appending the new Huey `task_id` to `task_history`. Active execution locks in Redis prevent duplicate concurrent execution of the same durable job.
+### Atomic Owned Locks & Heartbeat Lease Renewal
+- Concurrent resume executions for the same durable `job_id` are prevented using atomic Redis locks (`SET durable_job_lock:<job_id> <task_id> NX PX 43200000`).
+- Long-running jobs run a background heartbeat thread that periodically extends the lease in Redis as long as ownership matches `task_id`.
+- Releasing the lock uses a Lua script that verifies the lock value still equals `task_id` before deleting it, preventing accidental lock releases across task boundaries.
 
 ---
 
-## 4. Job Manifest & Durable State
+## 4. Job Manifest & Canonical Generation Spec Hashing
 
 For every pipeline run, a durable job manifest JSON is maintained in `HF_WORK_REPO` under `jobs/{job_id}/manifest.json`.
 
@@ -55,8 +58,8 @@ The manifest records:
 - `pipeline`: Pipeline alias/node path (e.g., `factual-datagen-pipeline`).
 - `source_repo`, `source_revision`, `source_path`, `source_split`: Source document reference.
 - `work_repo` & `output_repo`: References to intermediate work and output repositories.
-- `configuration_hash`: SHA256 hash of merged/flattened configuration parameters.
-- `prompt_config_hash`: SHA256 hash of pipeline prompt templates.
+- `configuration_hash`: Deterministic SHA256 hash of the canonical generation specification (stripping runtime fields like `task_id`, `job_id`, `output_dir`, `input_dir`, `restored_shards`, etc.).
+- `prompt_config_hash`: SHA256 hash computed from live prompt files on disk.
 - `output_schema_version`: Version string for target output format.
 - `code_revision`: Git commit SHA or version string of Augmentoolkit.
 - `current_stage` & `current_shard`: Current stage and work unit index.
@@ -69,38 +72,41 @@ The manifest records:
 
 ---
 
-## 5. Remote-First Checkpointing & Fail-Closed Semantics
+## 5. Remote-First Checkpointing, Local Hydration & Fail-Closed Semantics
 
 Checkpoint persistence is **remote-first**:
 1. Intermediate step outputs and shard results are saved locally in temporary JSON files.
 2. The checkpoint file (with computed SHA256 checksum) and updated `manifest.json` are uploaded immediately to `HF_WORK_REPO`.
 3. **Verification**: The system verifies remote existence on Hugging Face Hub before marking the checkpoint durable in the manifest.
 4. **Local Cleanup**: Temporary local files are deleted **only after** successful remote confirmation.
-5. **Fail-Closed Semantics**: If `HF_WORK_REPO` is configured and initial manifest creation, checkpoint upload, or remote verification fails, the job fails closed immediately. It does **not** downgrade errors to warnings or start subprocesses without confirmed persistence.
+5. **Fail-Closed Semantics**: If `HF_WORK_REPO` is configured and initial manifest creation, checkpoint upload, or remote verification fails, the job fails closed immediately. It does **not** start subprocesses without confirmed persistence.
+
+### Local State Hydration on Resume
+When recovering a job on a fresh filesystem, `reconcile_and_resume_job` downloads remote checkpoints and hydrates them directly into the job's target local `output_dir` (e.g. `<output_dir>/<shard_id>.json`). When `PipelineStep.execute_pipeline` runs, `PipelineStep.load_dataset` finds the hydrated JSON files on disk and `read_previous_output` skips every record that was already completed!
 
 ### Corruption Safeguards
 Upon recovery, downloaded remote checkpoints are verified against recorded SHA256 checksums and JSON integrity. Any corrupted or hash-invalid checkpoint is automatically evicted from `completed_shards` so only that shard is re-executed.
 
 ---
 
-## 6. Stage/Shard Resumability & Recovery
+## 6. Incremental Sharded Output Finalization
 
-Jobs are partitioned into deterministic work units/shards:
-- **Completed Shards**: Listed in `completed_shards` in `manifest.json`. After a Space restart, completed shards are **never regenerated**.
-- **Partially Completed Shards**: Resumed from the latest usable checkpoint if supported; otherwise, only that specific work unit is restarted.
-- **Incompatible Resumes**: Continuation is automatically blocked if `source_repo`, `source_revision`, `source_path`, `source_split`, `configuration_hash`, `prompt_config_hash`, `output_schema_version`, or `code_revision` materially changed.
-- **Forking Incompatible Jobs**: Use `POST /jobs/{job_id}/fork` to spawn a new durable job with modified parameters rather than mixing incompatible outputs.
+Dataset output finalization streams results directly to `HF_OUTPUT_REPO` without loading full datasets into RAM:
+1. `finalize_job_sharded` scans the job's `output_dir` for output files (`.jsonl`, `.parquet`, `.json`).
+2. Reconciles previously uploaded shards recorded in `manifest.output_shards` by path and SHA256 hash, skipping valid already-uploaded shards on retry.
+3. Immediately uploads un-uploaded shards to `HF_OUTPUT_REPO` and records each shard in the manifest in `HF_WORK_REPO` after each upload.
+4. Task status in Redis is set to `COMPLETED` **only after** all HF output shards and manifest uploads succeed.
 
 ---
 
 ## 7. Work Loss Estimates & Non-Resumable Boundaries
 
 ### Granularity & Resumability Boundaries
-- **Fully Restart-Safe**: Stage boundaries, completed shards, and verified checkpoints.
-- **Within a Work Unit**: Individual LLM API calls within an active uncheckpointed batch/shard are executed concurrently. If a hard Space termination occurs mid-shard, in-flight API calls that were not yet committed to a confirmed checkpoint will be re-executed when that shard restarts.
+- **Fully Restart-Safe**: Verified stage boundaries, completed shards, and hydrated output files.
+- **Within a Work Unit**: Individual concurrent LLM API calls within an active uncheckpointed shard are in-flight. If a hard Space termination occurs mid-shard, uncheckpointed in-flight calls will be re-executed when that shard restarts.
 
 ### Maximum Expected Work Lost
-- **Worst-case loss on Space crash**: At most **1 active shard** or **1 micro-checkpoint interval** (e.g. ~10 minutes or 100 records, depending on configured policy). All previously verified shards remain fully intact in `HF_WORK_REPO`.
+- **Worst-case loss on Space crash**: At most **1 active shard** or **1 micro-checkpoint interval** (e.g. ~10 minutes or 100 records, depending on configured `CheckpointPolicy`). All previously verified shards remain fully intact in `HF_WORK_REPO`.
 
 ---
 
